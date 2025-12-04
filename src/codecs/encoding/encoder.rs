@@ -124,6 +124,22 @@ where
         Ok(())
     }
 
+    /// Attempt to encode a batch of events when the underlying serializer supports it.
+    pub fn try_encode_batch(
+        &mut self,
+        events: &[Event],
+        buffer: &mut BytesMut,
+    ) -> Option<Result<(), Error>> {
+        self.serializer
+            .try_encode_batch(events, buffer)
+            .map(|result| {
+                result.map_err(|error| {
+                    emit!(EncoderSerializeError { error: &error });
+                    Error::SerializingError(error)
+                })
+            })
+    }
+
     /// Serialize the event without applying framing, at the start of the provided buffer.
     fn serialize_at_start(&mut self, event: Event, buffer: &mut BytesMut) -> Result<(), Error> {
         self.serializer.encode(event, buffer).map_err(|error| {
@@ -181,6 +197,7 @@ impl Encoder<Framer> {
             (Serializer::Json(_) | Serializer::NativeJson(_), Framer::NewlineDelimited(_)) => {
                 "application/x-ndjson"
             }
+            (Serializer::Parquet(_), _) => "application/vnd.apache.parquet",
             (
                 Serializer::Gelf(_) | Serializer::Json(_) | Serializer::NativeJson(_),
                 Framer::CharacterDelimited(CharacterDelimitedEncoder { delimiter: b',' }),

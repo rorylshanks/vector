@@ -4,8 +4,8 @@ use bytes::BytesMut;
 use itertools::{Itertools, Position};
 use tokio_util::codec::Encoder as _;
 use vector_lib::{
-    EstimatedJsonEncodedSizeOf, codecs::encoding::Framer, config::telemetry,
-    request_metadata::GroupedCountByteSize,
+    EstimatedJsonEncodedSizeOf, codecs::encoding::Framer, codecs::encoding::Serializer,
+    config::telemetry, request_metadata::GroupedCountByteSize,
 };
 
 #[cfg(feature = "codecs-arrow")]
@@ -32,14 +32,39 @@ impl Encoder<Vec<Event>> for (Transformer, crate::codecs::Encoder<Framer>) {
         writer: &mut dyn io::Write,
     ) -> io::Result<(usize, GroupedCountByteSize)> {
         let mut encoder = self.1.clone();
+        let mut byte_size = telemetry().create_request_count_byte_size();
+
+        if matches!(encoder.serializer(), Serializer::Parquet(_)) {
+            let mut transformed_events = Vec::with_capacity(events.len());
+            for mut event in events {
+                self.0.transform(&mut event);
+                byte_size.add_event(&event, event.estimated_json_encoded_size_of());
+                transformed_events.push(event);
+            }
+
+            if transformed_events.is_empty() {
+                return Ok((0, byte_size));
+            }
+
+            let mut bytes = BytesMut::new();
+            if let Some(result) = encoder.try_encode_batch(&transformed_events, &mut bytes) {
+                result.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                write_all(writer, transformed_events.len(), &bytes)?;
+                return Ok((bytes.len(), byte_size));
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "parquet serializer does not support streaming encoding",
+            ));
+        }
+
         let mut bytes_written = 0;
         let mut n_events_pending = events.len();
         let is_empty = events.is_empty();
         let batch_prefix = encoder.batch_prefix();
         write_all(writer, n_events_pending, batch_prefix)?;
         bytes_written += batch_prefix.len();
-
-        let mut byte_size = telemetry().create_request_count_byte_size();
 
         for (position, mut event) in events.into_iter().with_position() {
             self.0.transform(&mut event);

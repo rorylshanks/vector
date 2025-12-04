@@ -227,6 +227,7 @@ fn serializer_config_to_deserializer(
         SerializerConfig::Logfmt => todo!(),
         SerializerConfig::Native => DeserializerConfig::Native,
         SerializerConfig::NativeJson => DeserializerConfig::NativeJson(Default::default()),
+        SerializerConfig::Parquet(_) => todo!(),
         SerializerConfig::Protobuf(config) => {
             DeserializerConfig::Protobuf(vector_lib::codecs::decoding::ProtobufDeserializerConfig {
                 protobuf: vector_lib::codecs::decoding::ProtobufDeserializerOptions {
