@@ -2,7 +2,9 @@ use crate::codecs::{Encoder, EncoderKind, Transformer};
 use vector_lib::{
     codecs::{
         CharacterDelimitedEncoder, LengthDelimitedEncoder, NewlineDelimitedEncoder,
-        encoding::{Framer, FramingConfig, Serializer, SerializerConfig},
+        encoding::{
+            Framer, FramingConfig, Serializer, SerializerConfig, framing::BytesEncoderConfig,
+        },
     },
     configurable::configurable_component,
 };
@@ -113,6 +115,7 @@ impl EncodingConfigWithFraming {
             (None, Serializer::Avro(_) | Serializer::Native(_)) => {
                 LengthDelimitedEncoder::default().into()
             }
+            (None, Serializer::Parquet(_)) => Framer::Bytes(BytesEncoderConfig.build()),
             (None, Serializer::Gelf(_)) => {
                 // Graylog/GELF always uses null byte delimiter on TCP, see
                 // https://github.com/Graylog2/graylog2-server/issues/1240

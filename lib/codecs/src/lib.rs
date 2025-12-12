@@ -26,7 +26,9 @@ pub use encoding::{
     JsonSerializerConfig, LengthDelimitedEncoder, LengthDelimitedEncoderConfig, LogfmtSerializer,
     LogfmtSerializerConfig, NativeJsonSerializer, NativeJsonSerializerConfig, NativeSerializer,
     NativeSerializerConfig, NewlineDelimitedEncoder, NewlineDelimitedEncoderConfig,
-    RawMessageSerializer, RawMessageSerializerConfig, TextSerializer, TextSerializerConfig,
+    ParquetCompression, ParquetEncoding, ParquetField, ParquetFieldType, ParquetSerializer,
+    ParquetSerializerConfig, ParquetSerializerOptions, RawMessageSerializer,
+    RawMessageSerializerConfig, TextSerializer, TextSerializerConfig,
 };
 pub use gelf::{VALID_FIELD_REGEX, gelf_fields};
 use vector_config_macros::configurable_component;

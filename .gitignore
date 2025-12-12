@@ -64,3 +64,4 @@ volumes/
 
 # LLM tools
 copilot-instructions.md
+.cargo
