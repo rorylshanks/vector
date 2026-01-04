@@ -549,14 +549,62 @@ components: sinks: aws_s3: components._aws & {
 
 				If not specified, rows are written in the order they appear in the batch.
 
+				### rows_per_file (Super-Batch Mode)
+
+				Split large batches into multiple smaller Parquet files while maintaining sort order across files.
+				This is powerful for analytics workloads because it ensures data is sorted both **within** individual
+				files AND **across** files, enabling query engines to skip entire files based on min/max statistics.
+
+				**Use case example:**
+				With a batch of 100,000 events sorted by timestamp and `rows_per_file: 10000`:
+				- 10 Parquet files are produced, each with ~10,000 rows
+				- File 1 contains the oldest 10,000 events
+				- File 10 contains the newest 10,000 events
+				- Query engines can skip entire files when filtering by timestamp
+
+				**Configuration:**
+				```yaml
+				encoding:
+				  codec: parquet
+				  parquet:
+				    schema:
+				      timestamp: { type: timestamp_microsecond }
+				      user_id: { type: utf8 }
+				    sorting_columns:
+				      - column: timestamp
+				        descending: false
+				    rows_per_file: 10000  # Split into files of 10k rows each
+				batch:
+				  max_events: 100000      # Collect 100k events before processing
+				  timeout_secs: 300
+				```
+
+				**Recommended settings:**
+				- Set `batch.max_events` to your desired super-batch size (e.g., 100,000)
+				- Set `rows_per_file` to your desired file size (e.g., 10,000)
+				- Configure `sorting_columns` to define the sort order
+				- Use `rows_per_file` values that align with your query patterns (e.g., if queries typically
+				  scan 1 hour of data and you have ~10k events/hour, use `rows_per_file: 10000`)
+
+				**When to use:**
+				- Time-series data where you want cross-file ordering for efficient range queries
+				- Large batch sizes where you want smaller, more manageable files
+				- Workloads where query engines benefit from file-level pruning
+
+				If not specified, each batch produces exactly one Parquet file.
+
 				## Batching Behavior
 
-				Each batch of events becomes **one Parquet file** in S3. The batch size is controlled by:
+				By default, each batch of events becomes **one Parquet file** in S3. The batch size is controlled by:
 				- `batch.max_events`: Maximum number of events per file
 				- `batch.max_bytes`: Maximum bytes per file
 				- `batch.timeout_secs`: Maximum time to wait before flushing
 
 				Example: With `max_events: 50000`, each Parquet file will contain up to 50,000 rows.
+
+				When `rows_per_file` is configured, a single batch can produce **multiple Parquet files**.
+				For example, with `batch.max_events: 100000` and `rows_per_file: 10000`, each batch
+				produces up to 10 files of ~10,000 rows each.
 
 				## Important Notes
 
