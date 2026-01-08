@@ -4,7 +4,8 @@
 //! This encoder writes complete Parquet files with proper metadata and footers,
 //! suitable for long-term storage and analytics workloads.
 
-use arrow::datatypes::Schema;
+use arrow::array::ArrayRef;
+use arrow::datatypes::{DataType, Schema};
 use bytes::{BufMut, Bytes, BytesMut};
 use parquet::{
     arrow::ArrowWriter,
@@ -13,6 +14,7 @@ use parquet::{
     schema::types::ColumnPath,
 };
 use snafu::Snafu;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use vector_config::configurable_component;
 
@@ -20,6 +22,7 @@ use vector_core::event::Event;
 
 // Reuse the Arrow encoder's record batch building logic
 use super::arrow::{ArrowEncodingError, build_record_batch};
+use super::json_column::{JsonColumnProcessor, ProcessedJsonColumns};
 use super::schema_definition::SchemaDefinition;
 
 /// Compression algorithm for Parquet files
@@ -96,7 +99,7 @@ impl From<ParquetWriterVersion> for WriterVersion {
 
 /// Configuration for Parquet serialization
 #[configurable_component]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ParquetSerializerConfig {
     /// The Arrow schema definition to use for encoding
     ///
@@ -308,6 +311,54 @@ pub struct ParquetSerializerConfig {
     #[configurable(metadata(docs::examples = 10000))]
     #[configurable(metadata(docs::examples = 50000))]
     pub rows_per_file: Option<usize>,
+
+    /// JSON columns to expand into subcolumns (similar to ClickHouse JSON type)
+    ///
+    /// When configured, JSON string columns are parsed and expanded into individual
+    /// subcolumns for efficient columnar storage and querying. This is particularly
+    /// useful for event data with nested properties.
+    ///
+    /// **How it works:**
+    /// 1. The JSON column is parsed and flattened using dot notation
+    ///    (e.g., `properties.user.id` becomes `properties.user.id`)
+    /// 2. Types are inferred from values with fallback to strings
+    /// 3. Columns are prioritized by non-null/non-empty count per batch
+    /// 4. Top `max_subcolumns` keys become dedicated columns
+    /// 5. Overflow keys are hashed into bucket map columns
+    ///
+    /// **Column naming:**
+    /// - Subcolumns: `{column}.{path}` (e.g., `properties.$ip`)
+    /// - Bucket maps: `{column}__json_type_bucket_{n}` (e.g., `properties__json_type_bucket_0`)
+    ///
+    /// **Example configuration:**
+    /// ```yaml
+    /// json_columns:
+    ///   - column: properties
+    ///     max_subcolumns: 1024
+    ///     bucket_count: 256
+    ///     max_depth: 10
+    /// ```
+    #[serde(default)]
+    pub json_columns: Option<Vec<JsonColumnConfig>>,
+}
+
+impl Default for ParquetSerializerConfig {
+    fn default() -> Self {
+        Self {
+            schema: None,
+            infer_schema: false,
+            exclude_columns: None,
+            max_columns: default_max_columns(), // 1000
+            compression: ParquetCompression::default(),
+            compression_level: None,
+            writer_version: ParquetWriterVersion::default(),
+            row_group_size: None,
+            allow_nullable_fields: false,
+            sorting_columns: None,
+            rows_per_file: None,
+            json_columns: None,
+        }
+    }
 }
 
 /// Column sorting configuration
@@ -326,6 +377,121 @@ pub struct SortingColumnConfig {
     #[serde(default)]
     #[configurable(metadata(docs::examples = true))]
     pub descending: bool,
+}
+
+/// Configuration for JSON column expansion (similar to ClickHouse JSON type)
+///
+/// When configured, JSON string columns are expanded into individual subcolumns
+/// for efficient columnar storage and querying. Keys that don't fit within the
+/// max_subcolumns limit are placed into hash-bucketed map columns.
+#[configurable_component]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsonColumnConfig {
+    /// Name of the column containing JSON data to expand
+    ///
+    /// This column should contain valid JSON object strings.
+    #[configurable(metadata(docs::examples = "properties"))]
+    #[configurable(metadata(docs::examples = "attributes"))]
+    pub column: String,
+
+    /// Maximum number of subcolumns to create from the JSON data
+    ///
+    /// Subcolumns are prioritized by the number of non-null/non-empty values
+    /// in each batch. Keys beyond this limit are stored in bucketed map columns.
+    #[serde(default = "default_json_max_subcolumns")]
+    #[configurable(metadata(docs::examples = 1024))]
+    pub max_subcolumns: usize,
+
+    /// Number of hash buckets for overflow keys
+    ///
+    /// Keys that don't fit in the max_subcolumns limit are hashed into
+    /// this many buckets. Column names follow the pattern:
+    /// `{column}__json_type_bucket_{n}` where n is the bucket index.
+    #[serde(default = "default_json_bucket_count")]
+    #[configurable(metadata(docs::examples = 256))]
+    pub bucket_count: usize,
+
+    /// Maximum depth to flatten nested objects
+    ///
+    /// Objects nested deeper than this level are stored as JSON strings.
+    /// Keys are flattened using dot notation (e.g., `user.address.city`).
+    #[serde(default = "default_json_max_depth")]
+    #[configurable(metadata(docs::examples = 10))]
+    pub max_depth: usize,
+
+    /// Keep the original JSON column as a string alongside the subcolumns
+    ///
+    /// When true, the original column is preserved as a string column.
+    /// When false, only the expanded subcolumns are written.
+    #[serde(default = "default_keep_original_column")]
+    #[configurable(metadata(docs::examples = true))]
+    pub keep_original_column: bool,
+
+    /// Type hints for specific JSON paths
+    ///
+    /// Provides hints for type inference on specific keys. Keys should use
+    /// dot notation for nested paths. If type inference fails, values
+    /// are stored as strings.
+    ///
+    /// Supported types: `string`, `int64`, `uint64`, `float64`, `boolean`
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "type_hints_example()"))]
+    pub type_hints: Option<BTreeMap<String, JsonTypeHint>>,
+}
+
+impl Default for JsonColumnConfig {
+    fn default() -> Self {
+        Self {
+            column: String::new(),
+            max_subcolumns: default_json_max_subcolumns(),
+            bucket_count: default_json_bucket_count(),
+            max_depth: default_json_max_depth(),
+            keep_original_column: default_keep_original_column(),
+            type_hints: None,
+        }
+    }
+}
+
+/// Type hint for JSON value inference
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JsonTypeHint {
+    /// UTF-8 string
+    #[default]
+    String,
+    /// 64-bit signed integer
+    Int64,
+    /// 64-bit unsigned integer
+    Uint64,
+    /// 64-bit floating point
+    Float64,
+    /// Boolean
+    Boolean,
+}
+
+fn default_json_max_subcolumns() -> usize {
+    1024
+}
+
+fn default_json_bucket_count() -> usize {
+    256
+}
+
+fn default_json_max_depth() -> usize {
+    10
+}
+
+fn default_keep_original_column() -> bool {
+    true
+}
+
+fn type_hints_example() -> BTreeMap<String, JsonTypeHint> {
+    let mut hints = BTreeMap::new();
+    hints.insert("user.age".to_string(), JsonTypeHint::Int64);
+    hints.insert("metrics.count".to_string(), JsonTypeHint::Uint64);
+    hints.insert("score".to_string(), JsonTypeHint::Float64);
+    hints
 }
 
 fn default_max_columns() -> usize {
@@ -399,6 +565,7 @@ impl ParquetSerializerConfig {
             allow_nullable_fields: false,
             sorting_columns: None,
             rows_per_file: None,
+            json_columns: None,
         }
     }
 
@@ -459,6 +626,8 @@ pub struct ParquetSerializer {
     sorting_columns: Option<Vec<SortingColumnConfig>>,
     /// Maximum rows per file for super-batch mode
     rows_per_file: Option<usize>,
+    /// JSON column processors for expanding JSON columns into subcolumns
+    json_column_processors: Option<Vec<JsonColumnProcessor>>,
 }
 
 impl ParquetSerializer {
@@ -584,12 +753,26 @@ impl ParquetSerializer {
 
         let writer_properties = props_builder.build();
 
+        // Create JSON column processors if configured
+        let json_column_processors = config.json_columns.map(|json_cols| {
+            json_cols
+                .into_iter()
+                .map(|col_config| JsonColumnProcessor::new(col_config))
+                .collect()
+        });
+
         Ok(Self {
             schema_mode,
             writer_properties,
             sorting_columns: config.sorting_columns,
             rows_per_file: config.rows_per_file,
+            json_column_processors,
         })
+    }
+
+    /// Returns true if JSON column expansion is enabled
+    pub fn has_json_columns(&self) -> bool {
+        self.json_column_processors.is_some()
     }
 
     /// Returns true if super-batch mode is enabled (rows_per_file is set)
@@ -622,14 +805,24 @@ impl ParquetSerializer {
         // Determine schema
         let schema = self.resolve_schema(&events)?;
 
-        // If we don't need to split AND no sorting is configured, encode directly
-        if events.len() <= rows_per_file && self.sorting_columns.is_none() {
+        // If we don't need to split AND no sorting AND no JSON expansion, encode directly
+        if events.len() <= rows_per_file
+            && self.sorting_columns.is_none()
+            && self.json_column_processors.is_none()
+        {
             let bytes = encode_events_to_parquet(&events, schema, &self.writer_properties)?;
             return Ok(vec![bytes]);
         }
 
         // Build the full record batch
         let record_batch = build_record_batch(Arc::clone(&schema), &events)?;
+
+        // If JSON column processors are configured, expand JSON columns
+        let record_batch = if let Some(processors) = &self.json_column_processors {
+            expand_json_columns(record_batch, processors, &events)?
+        } else {
+            record_batch
+        };
 
         // Sort (if configured) and split the record batch
         self.sort_and_split_batch(record_batch, rows_per_file)
@@ -761,7 +954,17 @@ impl tokio_util::codec::Encoder<Vec<Event>> for ParquetSerializer {
             } => infer_schema_from_events(&events, exclude_columns, *max_columns)?,
         };
 
-        let bytes = encode_events_to_parquet(&events, schema, &self.writer_properties)?;
+        // Build the initial record batch
+        let record_batch = build_record_batch(schema.clone(), &events)?;
+
+        // If JSON column processors are configured, expand JSON columns
+        let final_batch = if let Some(processors) = &self.json_column_processors {
+            expand_json_columns(record_batch, processors, &events)?
+        } else {
+            record_batch
+        };
+
+        let bytes = encode_record_batch_to_parquet(&final_batch, &self.writer_properties)?;
 
         // Use put() instead of extend_from_slice to avoid copying when possible
         buffer.put(bytes);
@@ -949,6 +1152,123 @@ fn infer_schema_from_events(
         .collect();
 
     Ok(Arc::new(Schema::new(arrow_fields)))
+}
+
+/// Expand JSON columns in a record batch using the configured processors
+///
+/// This function:
+/// 1. Extracts JSON string data from specified columns
+/// 2. Flattens nested JSON objects into subcolumns
+/// 3. Creates bucket maps for overflow keys
+/// 4. Returns a new record batch with expanded columns
+fn expand_json_columns(
+    record_batch: arrow::array::RecordBatch,
+    processors: &[JsonColumnProcessor],
+    _events: &[Event],
+) -> Result<arrow::array::RecordBatch, ParquetEncodingError> {
+    use arrow::array::{Array, RecordBatch, StringArray};
+    use arrow::datatypes::{Field, Schema};
+
+    let schema = record_batch.schema();
+    let num_rows = record_batch.num_rows();
+
+    // Collect new fields and arrays
+    let mut new_fields: Vec<Arc<Field>> = Vec::new();
+    let mut new_arrays: Vec<ArrayRef> = Vec::new();
+
+    // Track which columns to exclude (the original JSON columns if not keeping them)
+    let mut columns_to_expand: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for processor in processors {
+        columns_to_expand.insert(processor.column_name().to_string());
+    }
+
+    // Process each JSON column
+    let mut processed_columns: Vec<ProcessedJsonColumns> = Vec::new();
+    for processor in processors {
+        let column_name = processor.column_name();
+
+        // Find the column in the record batch
+        if let Some(col_idx) = schema.fields().iter().position(|f| f.name() == column_name) {
+            let array = record_batch.column(col_idx);
+
+            // Try to cast to StringArray
+            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                // Extract string values
+                let json_values: Vec<Option<&str>> = (0..num_rows)
+                    .map(|i| {
+                        if string_array.is_null(i) {
+                            None
+                        } else {
+                            Some(string_array.value(i))
+                        }
+                    })
+                    .collect();
+
+                // Process the JSON column
+                let processed = processor.process_batch(json_values.into_iter());
+                processed_columns.push(processed);
+            } else {
+                tracing::warn!(
+                    column = column_name,
+                    "JSON column is not a string type, skipping expansion"
+                );
+            }
+        } else {
+            tracing::debug!(
+                column = column_name,
+                "JSON column not found in schema, skipping"
+            );
+        }
+    }
+
+    // First, add all non-JSON columns as-is
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let field_name = field.name();
+        let was_expanded = processed_columns
+            .iter()
+            .any(|p| p.column_name == *field_name);
+
+        if !was_expanded {
+            new_fields.push(Arc::new(Field::new(
+                field_name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            )));
+            new_arrays.push(record_batch.column(idx).clone());
+        }
+        // JSON columns are replaced by expanded subcolumns below
+    }
+
+    // Add expanded columns from processed JSON columns
+    for processed in &processed_columns {
+        // Add original column if kept
+        if let Some((name, array)) = processed.original_to_array() {
+            new_fields.push(Arc::new(Field::new(&name, DataType::Utf8, true)));
+            new_arrays.push(array);
+        }
+
+        // Add subcolumns
+        for (name, array) in processed.subcolumns_to_arrays() {
+            let data_type = array.data_type().clone();
+            new_fields.push(Arc::new(Field::new(&name, data_type, true)));
+            new_arrays.push(array);
+        }
+
+        // Add bucket maps
+        for (name, array) in processed.bucket_maps_to_arrays() {
+            let data_type = array.data_type().clone();
+            new_fields.push(Arc::new(Field::new(&name, data_type, true)));
+            new_arrays.push(array);
+        }
+    }
+
+    // Create new schema and record batch
+    let new_schema = Arc::new(Schema::new(new_fields));
+    let new_batch = RecordBatch::try_new(new_schema, new_arrays).map_err(|e| {
+        ArrowEncodingError::RecordBatchCreation { source: e }
+    })?;
+
+    Ok(new_batch)
 }
 
 /// Encodes a batch of events into Parquet format
@@ -1266,6 +1586,7 @@ mod tests {
             allow_nullable_fields: false,
             sorting_columns: None,
             rows_per_file: None,
+            json_columns: None,
         };
 
         let serializer = ParquetSerializer::new(config);
@@ -1286,6 +1607,7 @@ mod tests {
             allow_nullable_fields: false,
             sorting_columns: None,
             rows_per_file: None,
+            json_columns: None,
         };
 
         let result = ParquetSerializer::new(config);
@@ -1782,5 +2104,359 @@ mod tests {
             "Expected error about rows_per_file being > 0, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_json_column_expansion() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+        use tokio_util::codec::Encoder;
+
+        // Create events with a JSON properties column
+        let mut log1 = LogEvent::default();
+        log1.insert("event_type", "click");
+        log1.insert(
+            "properties",
+            r#"{"$ip":"192.168.1.1","user_id":"user123","page_views":42,"is_premium":true}"#,
+        );
+
+        let mut log2 = LogEvent::default();
+        log2.insert("event_type", "view");
+        log2.insert(
+            "properties",
+            r#"{"$ip":"10.0.0.1","user_id":"user456","page_views":100,"is_premium":false,"extra_field":"value"}"#,
+        );
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+
+        // Create explicit schema for the two columns
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "event_type".to_string(),
+            FieldDefinition {
+                r#type: "utf8".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+        fields.insert(
+            "properties".to_string(),
+            FieldDefinition {
+                r#type: "utf8".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        // Create a config with JSON column expansion
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.json_columns = Some(vec![JsonColumnConfig {
+            column: "properties".to_string(),
+            max_subcolumns: 3, // Only expand top 3 keys
+            bucket_count: 2,   // Use 2 buckets for overflow
+            max_depth: 5,
+            keep_original_column: true,
+            type_hints: None,
+        }]);
+
+        let mut serializer = ParquetSerializer::new(config).expect("Failed to create serializer");
+        assert!(serializer.has_json_columns());
+
+        let mut buffer = BytesMut::new();
+        serializer
+            .encode(events, &mut buffer)
+            .expect("Failed to encode events");
+
+        // Verify it's valid Parquet by reading it back
+        let bytes = Bytes::from(buffer.to_vec());
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("Failed to create reader")
+            .build()
+            .expect("Failed to build reader");
+
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().expect("Failed to read batches");
+        assert_eq!(batches.len(), 1);
+
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+
+        // Check that we have the expected columns:
+        // - event_type (original)
+        // - properties (original JSON string, kept)
+        // - properties.$ip (subcolumn)
+        // - properties.user_id (subcolumn)
+        // - properties.page_views (subcolumn)
+        // - properties__json_type_bucket_0 (bucket map)
+        // - properties__json_type_bucket_1 (bucket map)
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Should have the original properties column
+        assert!(
+            field_names.contains(&"properties"),
+            "Expected 'properties' column, got: {:?}",
+            field_names
+        );
+
+        // Should have some subcolumns (the exact ones depend on priority calculation)
+        let subcolumn_count = field_names
+            .iter()
+            .filter(|n| n.starts_with("properties."))
+            .count();
+        assert!(
+            subcolumn_count > 0,
+            "Expected at least one properties.* subcolumn, got: {:?}",
+            field_names
+        );
+
+        // Should have bucket map columns
+        let bucket_count = field_names
+            .iter()
+            .filter(|n| n.starts_with("properties__json_type_bucket_"))
+            .count();
+        assert_eq!(
+            bucket_count, 2,
+            "Expected 2 bucket columns, got {} in: {:?}",
+            bucket_count, field_names
+        );
+
+        // Verify bucket columns are Map<String, String> type
+        for field in schema.fields() {
+            if field.name().starts_with("properties__json_type_bucket_") {
+                match field.data_type() {
+                    DataType::Map(_, _) => {}
+                    other => panic!(
+                        "Expected bucket column to be Map type, got: {:?}",
+                        other
+                    ),
+                }
+            }
+        }
+
+        println!("JSON column expansion test passed! Columns: {:?}", field_names);
+    }
+
+    #[test]
+    fn test_json_column_type_inference() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+        use tokio_util::codec::Encoder;
+
+        // Create events with various JSON value types
+        let mut log1 = LogEvent::default();
+        log1.insert(
+            "data",
+            r#"{"string_val":"hello","int_val":42,"float_val":3.14,"bool_val":true}"#,
+        );
+
+        let mut log2 = LogEvent::default();
+        log2.insert(
+            "data",
+            r#"{"string_val":"world","int_val":100,"float_val":2.71,"bool_val":false}"#,
+        );
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+
+        // Create explicit schema
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "data".to_string(),
+            FieldDefinition {
+                r#type: "utf8".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.json_columns = Some(vec![JsonColumnConfig {
+            column: "data".to_string(),
+            max_subcolumns: 10,
+            bucket_count: 4,
+            max_depth: 3,
+            keep_original_column: false, // Don't keep original
+            type_hints: None,
+        }]);
+
+        let mut serializer = ParquetSerializer::new(config).expect("Failed to create serializer");
+        let mut buffer = BytesMut::new();
+        serializer
+            .encode(events, &mut buffer)
+            .expect("Failed to encode events");
+
+        let bytes = Bytes::from(buffer.to_vec());
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("Failed to create reader")
+            .build()
+            .expect("Failed to build reader");
+
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().expect("Failed to read batches");
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        // Should NOT have the original 'data' column since keep_original_column is false
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            !field_names.contains(&"data"),
+            "Original 'data' column should not be present when keep_original_column is false"
+        );
+
+        // Check subcolumns exist with inferred types
+        let string_field = schema.field_with_name("data.string_val");
+        assert!(string_field.is_ok(), "Expected data.string_val field");
+        assert_eq!(
+            string_field.unwrap().data_type(),
+            &DataType::Utf8,
+            "string_val should be Utf8"
+        );
+
+        println!("JSON column type inference test passed! Fields: {:?}", field_names);
+    }
+
+    #[test]
+    fn test_json_column_nested_objects() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+        use tokio_util::codec::Encoder;
+
+        // Create events with nested JSON
+        let mut log = LogEvent::default();
+        log.insert(
+            "event",
+            r#"{"user":{"name":"Alice","address":{"city":"NYC","zip":"10001"}},"action":"login"}"#,
+        );
+
+        let events = vec![Event::Log(log)];
+
+        // Create explicit schema
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "event".to_string(),
+            FieldDefinition {
+                r#type: "utf8".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.json_columns = Some(vec![JsonColumnConfig {
+            column: "event".to_string(),
+            max_subcolumns: 100,
+            bucket_count: 4,
+            max_depth: 3, // Allow 3 levels of nesting
+            keep_original_column: true,
+            type_hints: None,
+        }]);
+
+        let mut serializer = ParquetSerializer::new(config).expect("Failed to create serializer");
+        let mut buffer = BytesMut::new();
+        serializer
+            .encode(events, &mut buffer)
+            .expect("Failed to encode events");
+
+        let bytes = Bytes::from(buffer.to_vec());
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("Failed to create reader")
+            .build()
+            .expect("Failed to build reader");
+
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().expect("Failed to read batches");
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Should have flattened nested keys
+        assert!(
+            field_names.contains(&"event.action"),
+            "Expected event.action field, got: {:?}",
+            field_names
+        );
+        assert!(
+            field_names.contains(&"event.user.name"),
+            "Expected event.user.name field, got: {:?}",
+            field_names
+        );
+        assert!(
+            field_names.contains(&"event.user.address.city"),
+            "Expected event.user.address.city field, got: {:?}",
+            field_names
+        );
+
+        println!("JSON nested objects test passed! Fields: {:?}", field_names);
+    }
+
+    #[test]
+    fn test_infer_schema_basic() {
+        use tokio_util::codec::Encoder;
+
+        // Test basic schema inference without JSON columns
+        let mut log1 = LogEvent::default();
+        log1.insert("name", "Alice");
+        log1.insert("age", 30_i64);
+
+        let mut log2 = LogEvent::default();
+        log2.insert("name", "Bob");
+        log2.insert("age", 25_i64);
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+
+        // Debug: print what all_event_fields returns
+        for (i, event) in events.iter().enumerate() {
+            if let Event::Log(log) = event {
+                println!("Event {} fields:", i);
+                if let Some(fields) = log.all_event_fields() {
+                    for (key, value) in fields {
+                        println!("  {} = {:?}", key, value);
+                    }
+                } else {
+                    println!("  <all_event_fields returned None>");
+                }
+            }
+        }
+
+        // Create config with infer_schema enabled
+        let mut config = ParquetSerializerConfig::default();
+        config.infer_schema = true;
+
+        let mut serializer = ParquetSerializer::new(config).expect("Failed to create serializer");
+        let mut buffer = BytesMut::new();
+
+        serializer
+            .encode(events, &mut buffer)
+            .expect("Failed to encode events with infer_schema");
+
+        // Verify we got some output
+        assert!(!buffer.is_empty(), "Buffer should not be empty");
+
+        let bytes = Bytes::from(buffer.to_vec());
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("Failed to create reader")
+            .build()
+            .expect("Failed to build reader");
+
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().expect("Failed to read batches");
+        let batch = &batches[0];
+        let schema = batch.schema();
+
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert!(
+            field_names.contains(&"name"),
+            "Expected 'name' field, got: {:?}",
+            field_names
+        );
+        assert!(
+            field_names.contains(&"age"),
+            "Expected 'age' field, got: {:?}",
+            field_names
+        );
+
+        println!("Infer schema basic test passed! Fields: {:?}", field_names);
     }
 }

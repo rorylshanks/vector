@@ -11,6 +11,8 @@ mod common;
 mod csv;
 mod gelf;
 mod json;
+#[cfg(feature = "parquet")]
+mod json_column;
 mod logfmt;
 mod native;
 mod native_json;
@@ -44,7 +46,8 @@ pub use native_json::{NativeJsonSerializer, NativeJsonSerializerConfig};
 pub use otlp::{OtlpSerializer, OtlpSerializerConfig};
 #[cfg(feature = "parquet")]
 pub use parquet::{
-    ParquetCompression, ParquetEncodingError, ParquetSerializer, ParquetSerializerConfig,
+    JsonColumnConfig, JsonTypeHint, ParquetCompression, ParquetEncodingError, ParquetSerializer,
+    ParquetSerializerConfig,
 };
 pub use protobuf::{ProtobufSerializer, ProtobufSerializerConfig, ProtobufSerializerOptions};
 pub use raw_message::{RawMessageSerializer, RawMessageSerializerConfig};
