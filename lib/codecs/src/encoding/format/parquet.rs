@@ -278,6 +278,36 @@ pub struct ParquetSerializerConfig {
     /// If not specified, rows are written in the order they appear in the batch.
     #[serde(default)]
     pub sorting_columns: Option<Vec<SortingColumnConfig>>,
+
+    /// Maximum number of rows per Parquet file when super-batching is enabled.
+    ///
+    /// When set, enables "super-batch" mode where a larger batch is first sorted (if
+    /// `sorting_columns` is configured) and then split into multiple smaller Parquet files,
+    /// each containing at most this many rows. This ensures data is sorted both within
+    /// individual files AND across files, which significantly improves query performance
+    /// for analytics workloads.
+    ///
+    /// **Use case example:**
+    /// With `rows_per_file: 10000` and a batch of 100,000 events sorted by timestamp:
+    /// - 10 Parquet files are produced, each with ~10,000 rows
+    /// - File 1 contains the oldest 10,000 events
+    /// - File 10 contains the newest 10,000 events
+    /// - Query engines can skip entire files based on min/max statistics
+    ///
+    /// **Memory efficiency:**
+    /// Sorting is performed using Arrow's index-based sorting, which avoids copying data.
+    /// Each chunk is materialized and written separately to minimize peak memory usage.
+    ///
+    /// **Recommended settings:**
+    /// - Set batch `max_events` to your desired super-batch size (e.g., 100,000)
+    /// - Set `rows_per_file` to your desired file size (e.g., 10,000)
+    /// - Configure `sorting_columns` to define the sort order
+    ///
+    /// If not specified, each batch produces exactly one Parquet file.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = 10000))]
+    #[configurable(metadata(docs::examples = 50000))]
+    pub rows_per_file: Option<usize>,
 }
 
 /// Column sorting configuration
@@ -368,6 +398,7 @@ impl ParquetSerializerConfig {
             row_group_size: None,
             allow_nullable_fields: false,
             sorting_columns: None,
+            rows_per_file: None,
         }
     }
 
@@ -376,13 +407,24 @@ impl ParquetSerializerConfig {
         // Must specify exactly one schema method
         match (self.schema.is_some(), self.infer_schema) {
             (true, true) => {
-                Err("Cannot use both 'schema' and 'infer_schema: true'. Choose one.".to_string())
+                return Err(
+                    "Cannot use both 'schema' and 'infer_schema: true'. Choose one.".to_string(),
+                );
             }
             (false, false) => {
-                Err("Must specify either 'schema' or 'infer_schema: true'".to_string())
+                return Err("Must specify either 'schema' or 'infer_schema: true'".to_string());
             }
-            _ => Ok(()),
+            _ => {}
         }
+
+        // Validate rows_per_file if set
+        if let Some(rows_per_file) = self.rows_per_file {
+            if rows_per_file == 0 {
+                return Err("'rows_per_file' must be greater than 0".to_string());
+            }
+        }
+
+        Ok(())
     }
 
     /// The data type of events that are accepted by `ParquetSerializer`.
@@ -413,6 +455,10 @@ enum SchemaMode {
 pub struct ParquetSerializer {
     schema_mode: SchemaMode,
     writer_properties: WriterProperties,
+    /// Sorting column configuration (column indices and sort order)
+    sorting_columns: Option<Vec<SortingColumnConfig>>,
+    /// Maximum rows per file for super-batch mode
+    rows_per_file: Option<usize>,
 }
 
 impl ParquetSerializer {
@@ -541,7 +587,160 @@ impl ParquetSerializer {
         Ok(Self {
             schema_mode,
             writer_properties,
+            sorting_columns: config.sorting_columns,
+            rows_per_file: config.rows_per_file,
         })
+    }
+
+    /// Returns true if super-batch mode is enabled (rows_per_file is set)
+    pub fn is_super_batch_enabled(&self) -> bool {
+        self.rows_per_file.is_some()
+    }
+
+    /// Returns the configured rows per file for super-batch mode
+    pub fn rows_per_file(&self) -> Option<usize> {
+        self.rows_per_file
+    }
+
+    /// Encode events into multiple Parquet files (super-batch mode).
+    ///
+    /// This method sorts the events (if sorting_columns is configured) and splits them
+    /// into multiple Parquet files, each containing at most `rows_per_file` rows.
+    ///
+    /// Memory efficiency: Sorting uses Arrow's index-based approach to avoid copying data.
+    /// Each chunk is materialized and written separately to minimize peak memory usage.
+    pub fn encode_batch_split(
+        &self,
+        events: Vec<Event>,
+    ) -> Result<Vec<Bytes>, ParquetEncodingError> {
+        let rows_per_file = self.rows_per_file.unwrap_or(events.len());
+
+        if events.is_empty() {
+            return Err(ParquetEncodingError::NoEvents);
+        }
+
+        // Determine schema
+        let schema = self.resolve_schema(&events)?;
+
+        // If we don't need to split AND no sorting is configured, encode directly
+        if events.len() <= rows_per_file && self.sorting_columns.is_none() {
+            let bytes = encode_events_to_parquet(&events, schema, &self.writer_properties)?;
+            return Ok(vec![bytes]);
+        }
+
+        // Build the full record batch
+        let record_batch = build_record_batch(Arc::clone(&schema), &events)?;
+
+        // Sort (if configured) and split the record batch
+        self.sort_and_split_batch(record_batch, rows_per_file)
+    }
+
+    /// Resolve schema based on mode
+    fn resolve_schema(&self, events: &[Event]) -> Result<Arc<Schema>, ParquetEncodingError> {
+        match &self.schema_mode {
+            SchemaMode::Explicit { schema } => Ok(Arc::clone(schema)),
+            SchemaMode::Inferred {
+                exclude_columns,
+                max_columns,
+            } => infer_schema_from_events(events, exclude_columns, *max_columns),
+        }
+    }
+
+    /// Sort the record batch and split into chunks, encoding each as a separate Parquet file.
+    ///
+    /// Memory efficiency strategy:
+    /// 1. Compute sort indices without copying data
+    /// 2. For each chunk, use `take` to extract only those rows
+    /// 3. Encode and write immediately, allowing the chunk to be freed
+    fn sort_and_split_batch(
+        &self,
+        batch: arrow::array::RecordBatch,
+        rows_per_file: usize,
+    ) -> Result<Vec<Bytes>, ParquetEncodingError> {
+        use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
+
+        let num_rows = batch.num_rows();
+        let schema = batch.schema();
+
+        // Compute sorted indices
+        let sorted_indices = if let Some(sorting_cols) = &self.sorting_columns {
+            // Build sort columns from config
+            let sort_columns: Vec<SortColumn> = sorting_cols
+                .iter()
+                .filter_map(|col_config| {
+                    schema
+                        .fields()
+                        .iter()
+                        .position(|f| f.name() == &col_config.column)
+                        .map(|idx| SortColumn {
+                            values: Arc::clone(batch.column(idx)),
+                            options: Some(SortOptions {
+                                descending: col_config.descending,
+                                nulls_first: false,
+                            }),
+                        })
+                })
+                .collect();
+
+            if sort_columns.is_empty() {
+                // No valid sort columns found, use natural order
+                None
+            } else {
+                Some(
+                    lexsort_to_indices(&sort_columns, None)
+                        .map_err(|e| ParquetEncodingError::RecordBatchCreation {
+                            source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
+                        })?,
+                )
+            }
+        } else {
+            None
+        };
+
+        // Calculate number of files needed
+        let num_files = (num_rows + rows_per_file - 1) / rows_per_file;
+        let mut parquet_files = Vec::with_capacity(num_files);
+
+        // Process each chunk
+        for chunk_idx in 0..num_files {
+            let start = chunk_idx * rows_per_file;
+            let end = std::cmp::min(start + rows_per_file, num_rows);
+            let chunk_len = end - start;
+
+            // Extract the chunk using sorted indices if available
+            let chunk_batch = if let Some(ref indices) = sorted_indices {
+                // Slice the indices for this chunk
+                let chunk_indices = indices.slice(start, chunk_len);
+
+                // Take rows according to the sorted indices
+                let chunk_columns: Result<Vec<_>, _> = batch
+                    .columns()
+                    .iter()
+                    .map(|col| take(col.as_ref(), &chunk_indices, None))
+                    .collect();
+
+                let chunk_columns = chunk_columns.map_err(|e| {
+                    ParquetEncodingError::RecordBatchCreation {
+                        source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
+                    }
+                })?;
+
+                arrow::array::RecordBatch::try_new(Arc::clone(&schema), chunk_columns).map_err(
+                    |e| ParquetEncodingError::RecordBatchCreation {
+                        source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
+                    },
+                )?
+            } else {
+                // No sorting, just slice the batch
+                batch.slice(start, chunk_len)
+            };
+
+            // Encode this chunk to Parquet
+            let bytes = encode_record_batch_to_parquet(&chunk_batch, &self.writer_properties)?;
+            parquet_files.push(bytes);
+        }
+
+        Ok(parquet_files)
     }
 }
 
@@ -775,6 +974,28 @@ pub fn encode_events_to_parquet(
             ArrowWriter::try_new(&mut buffer, batch_schema, Some(writer_properties.clone()))?;
 
         writer.write(&record_batch)?;
+        writer.close()?;
+    }
+
+    Ok(Bytes::from(buffer))
+}
+
+/// Encodes a pre-built RecordBatch into Parquet format
+///
+/// This is used by the super-batch functionality where the batch has already
+/// been built and potentially sorted/sliced.
+fn encode_record_batch_to_parquet(
+    record_batch: &arrow::array::RecordBatch,
+    writer_properties: &WriterProperties,
+) -> Result<Bytes, ParquetEncodingError> {
+    let batch_schema = record_batch.schema();
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer =
+            ArrowWriter::try_new(&mut buffer, batch_schema, Some(writer_properties.clone()))?;
+
+        writer.write(record_batch)?;
         writer.close()?;
     }
 
@@ -1044,6 +1265,7 @@ mod tests {
             row_group_size: Some(1000),
             allow_nullable_fields: false,
             sorting_columns: None,
+            rows_per_file: None,
         };
 
         let serializer = ParquetSerializer::new(config);
@@ -1063,6 +1285,7 @@ mod tests {
             row_group_size: None,
             allow_nullable_fields: false,
             sorting_columns: None,
+            rows_per_file: None,
         };
 
         let result = ParquetSerializer::new(config);
@@ -1204,5 +1427,360 @@ mod tests {
 
         assert_eq!(array.value(0), 42);
         assert!(array.is_null(1));
+    }
+
+    #[test]
+    fn test_super_batch_split_without_sorting() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "id".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        // Create 100 events
+        let events: Vec<Event> = (0..100)
+            .map(|i| {
+                let mut log = LogEvent::default();
+                log.insert("id", i);
+                Event::Log(log)
+            })
+            .collect();
+
+        // Configure super-batch with 30 rows per file (should produce 4 files)
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.rows_per_file = Some(30);
+
+        let serializer = ParquetSerializer::new(config).unwrap();
+        assert!(serializer.is_super_batch_enabled());
+
+        let files = serializer.encode_batch_split(events).unwrap();
+        assert_eq!(files.len(), 4); // 30 + 30 + 30 + 10 = 100
+
+        // Verify each file
+        let mut total_rows = 0;
+        for (i, file_bytes) in files.iter().enumerate() {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file_bytes.clone())
+                .unwrap()
+                .build()
+                .unwrap();
+
+            let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+            let batch = &batches[0];
+
+            if i < 3 {
+                assert_eq!(batch.num_rows(), 30);
+            } else {
+                assert_eq!(batch.num_rows(), 10);
+            }
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 100);
+    }
+
+    #[test]
+    fn test_super_batch_split_with_sorting() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "id".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        // Create 50 events in reverse order (50, 49, 48, ..., 1)
+        let events: Vec<Event> = (0..50)
+            .rev()
+            .map(|i| {
+                let mut log = LogEvent::default();
+                log.insert("id", i);
+                Event::Log(log)
+            })
+            .collect();
+
+        // Configure super-batch with sorting (ascending) and 20 rows per file
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.rows_per_file = Some(20);
+        config.sorting_columns = Some(vec![SortingColumnConfig {
+            column: "id".to_string(),
+            descending: false,
+        }]);
+
+        let serializer = ParquetSerializer::new(config).unwrap();
+        let files = serializer.encode_batch_split(events).unwrap();
+        assert_eq!(files.len(), 3); // 20 + 20 + 10 = 50
+
+        // Verify sorting across files - first file should have lowest ids
+        let first_file = ParquetRecordBatchReaderBuilder::try_new(files[0].clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let first_batches: Vec<_> = first_file.collect::<Result<_, _>>().unwrap();
+        let first_batch = &first_batches[0];
+        let first_ids = first_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // First file should contain ids 0-19 (sorted ascending)
+        assert_eq!(first_ids.value(0), 0);
+        assert_eq!(first_ids.value(19), 19);
+
+        // Second file should contain ids 20-39
+        let second_file = ParquetRecordBatchReaderBuilder::try_new(files[1].clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let second_batches: Vec<_> = second_file.collect::<Result<_, _>>().unwrap();
+        let second_batch = &second_batches[0];
+        let second_ids = second_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(second_ids.value(0), 20);
+        assert_eq!(second_ids.value(19), 39);
+
+        // Third file should contain ids 40-49
+        let third_file = ParquetRecordBatchReaderBuilder::try_new(files[2].clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let third_batches: Vec<_> = third_file.collect::<Result<_, _>>().unwrap();
+        let third_batch = &third_batches[0];
+        let third_ids = third_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(third_ids.value(0), 40);
+        assert_eq!(third_ids.value(9), 49);
+    }
+
+    #[test]
+    fn test_super_batch_descending_sort() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "timestamp".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        // Create 30 events with timestamps 0..30
+        let events: Vec<Event> = (0..30)
+            .map(|i| {
+                let mut log = LogEvent::default();
+                log.insert("timestamp", i);
+                Event::Log(log)
+            })
+            .collect();
+
+        // Configure super-batch with descending sort
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.rows_per_file = Some(10);
+        config.sorting_columns = Some(vec![SortingColumnConfig {
+            column: "timestamp".to_string(),
+            descending: true,
+        }]);
+
+        let serializer = ParquetSerializer::new(config).unwrap();
+        let files = serializer.encode_batch_split(events).unwrap();
+        assert_eq!(files.len(), 3);
+
+        // First file should have highest timestamps (29, 28, 27, ...)
+        let first_file = ParquetRecordBatchReaderBuilder::try_new(files[0].clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let first_batches: Vec<_> = first_file.collect::<Result<_, _>>().unwrap();
+        let first_batch = &first_batches[0];
+        let first_ts = first_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(first_ts.value(0), 29);
+        assert_eq!(first_ts.value(9), 20);
+    }
+
+    #[test]
+    fn test_super_batch_small_batch_no_split() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "id".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        // Create only 5 events
+        let events: Vec<Event> = (0..5)
+            .map(|i| {
+                let mut log = LogEvent::default();
+                log.insert("id", i);
+                Event::Log(log)
+            })
+            .collect();
+
+        // Configure super-batch with 10 rows per file
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.rows_per_file = Some(10);
+
+        let serializer = ParquetSerializer::new(config).unwrap();
+        let files = serializer.encode_batch_split(events).unwrap();
+
+        // Should produce only 1 file since we have fewer events than rows_per_file
+        assert_eq!(files.len(), 1);
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(files[0].clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        assert_eq!(batches[0].num_rows(), 5);
+    }
+
+    #[test]
+    fn test_super_batch_disabled_by_default() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "id".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        let config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        let serializer = ParquetSerializer::new(config).unwrap();
+
+        // Super-batch should be disabled when rows_per_file is not set
+        assert!(!serializer.is_super_batch_enabled());
+        assert!(serializer.rows_per_file().is_none());
+    }
+
+    #[test]
+    fn test_super_batch_sorts_without_split() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "id".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        // Create 10 events in reverse order (9, 8, 7, ..., 0)
+        let events: Vec<Event> = (0..10)
+            .rev()
+            .map(|i| {
+                let mut log = LogEvent::default();
+                log.insert("id", i);
+                Event::Log(log)
+            })
+            .collect();
+
+        // Configure with sorting but rows_per_file larger than batch size
+        // This means NO split should occur, but sorting SHOULD still happen
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.rows_per_file = Some(100); // Larger than our 10 events
+        config.sorting_columns = Some(vec![SortingColumnConfig {
+            column: "id".to_string(),
+            descending: false, // ascending
+        }]);
+
+        let serializer = ParquetSerializer::new(config).unwrap();
+        let files = serializer.encode_batch_split(events).unwrap();
+
+        // Should produce only 1 file (no split)
+        assert_eq!(files.len(), 1);
+
+        // But the data should be sorted (0, 1, 2, ..., 9)
+        let reader = ParquetRecordBatchReaderBuilder::try_new(files[0].clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        let batch = &batches[0];
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // Verify sorted order
+        assert_eq!(ids.value(0), 0);
+        assert_eq!(ids.value(5), 5);
+        assert_eq!(ids.value(9), 9);
+    }
+
+    #[test]
+    fn test_super_batch_rows_per_file_zero_fails() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "id".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.rows_per_file = Some(0);
+
+        // Should fail validation with a clear error
+        let result = ParquetSerializer::new(config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("rows_per_file") && err.contains("greater than 0"),
+            "Expected error about rows_per_file being > 0, got: {}",
+            err
+        );
     }
 }

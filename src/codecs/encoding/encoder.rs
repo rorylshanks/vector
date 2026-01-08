@@ -52,6 +52,58 @@ impl BatchEncoder {
             BatchSerializer::Parquet(_) => "application/vnd.apache.parquet",
         }
     }
+
+    /// Returns true if super-batch mode is enabled (Parquet with rows_per_file set).
+    ///
+    /// In super-batch mode, a single batch of events will be sorted and split into
+    /// multiple smaller Parquet files, ensuring data is ordered both within and across files.
+    #[allow(unused_variables)]
+    pub fn is_super_batch_enabled(&self) -> bool {
+        match &self.serializer {
+            #[cfg(feature = "codecs-parquet")]
+            BatchSerializer::Parquet(serializer) => serializer.is_super_batch_enabled(),
+            #[cfg(feature = "codecs-arrow")]
+            BatchSerializer::Arrow(_) => false,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
+    /// Encode events into multiple output files (super-batch mode).
+    ///
+    /// This is used when `is_super_batch_enabled()` returns true. The events are sorted
+    /// (if sorting_columns is configured) and split into multiple Parquet files.
+    ///
+    /// Returns a Vec of encoded Parquet files as Bytes.
+    #[cfg(feature = "codecs-parquet")]
+    pub fn encode_batch_split(&self, events: Vec<Event>) -> Result<Vec<bytes::Bytes>, Error> {
+        match &self.serializer {
+            BatchSerializer::Parquet(serializer) => {
+                serializer.encode_batch_split(events).map_err(|err| {
+                    use vector_lib::codecs::encoding::ParquetEncodingError;
+                    match &err {
+                        ParquetEncodingError::RecordBatchCreation { source } => {
+                            use vector_lib::codecs::encoding::ArrowEncodingError;
+                            match source {
+                                ArrowEncodingError::NullConstraint { .. } => {
+                                    Error::SchemaConstraintViolation(Box::new(err))
+                                }
+                                _ => Error::SerializingError(Box::new(err)),
+                            }
+                        }
+                        _ => Error::SerializingError(Box::new(err)),
+                    }
+                })
+            }
+            #[cfg(feature = "codecs-arrow")]
+            BatchSerializer::Arrow(_) => {
+                Err(Error::SerializingError(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Super-batch mode is only supported for Parquet encoding",
+                ))))
+            }
+        }
+    }
 }
 
 impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
@@ -104,6 +156,35 @@ pub enum EncoderKind {
     /// Encodes events in batches without framing
     #[cfg(any(feature = "codecs-arrow", feature = "codecs-parquet"))]
     Batch(Box<BatchEncoder>),
+}
+
+impl EncoderKind {
+    /// Returns true if super-batch mode is enabled.
+    ///
+    /// Super-batch mode is only available for Parquet encoding with `rows_per_file` configured.
+    /// In this mode, a large batch is sorted and split into multiple smaller files.
+    pub fn is_super_batch_enabled(&self) -> bool {
+        match self {
+            EncoderKind::Framed(_) => false,
+            #[cfg(any(feature = "codecs-arrow", feature = "codecs-parquet"))]
+            EncoderKind::Batch(encoder) => encoder.is_super_batch_enabled(),
+        }
+    }
+
+    /// Encode events into multiple output files (super-batch mode).
+    ///
+    /// Only valid when `is_super_batch_enabled()` returns true.
+    /// Returns an error for non-Parquet encoders or when super-batch is not configured.
+    #[cfg(feature = "codecs-parquet")]
+    pub fn encode_batch_split(&self, events: Vec<Event>) -> Result<Vec<bytes::Bytes>, Error> {
+        match self {
+            EncoderKind::Framed(_) => Err(Error::SerializingError(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Super-batch mode is only supported for batch encoders",
+            )))),
+            EncoderKind::Batch(encoder) => encoder.encode_batch_split(events),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
