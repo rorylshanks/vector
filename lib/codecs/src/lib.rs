@@ -28,6 +28,11 @@ pub use encoding::{
     NativeSerializerConfig, NewlineDelimitedEncoder, NewlineDelimitedEncoderConfig,
     RawMessageSerializer, RawMessageSerializerConfig, TextSerializer, TextSerializerConfig,
 };
+#[cfg(feature = "parquet")]
+pub use encoding::{
+    JsonColumnConfig, JsonTypeHint, ParquetCompression, ParquetEncodingError, ParquetSerializer,
+    ParquetSerializerConfig,
+};
 pub use gelf::{VALID_FIELD_REGEX, gelf_fields};
 use vector_config_macros::configurable_component;
 
