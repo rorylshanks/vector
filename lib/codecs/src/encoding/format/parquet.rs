@@ -871,9 +871,10 @@ impl ParquetSerializer {
         // Build the full record batch
         let record_batch = build_record_batch(Arc::clone(&schema), &events)?;
 
-        // Use memory-mapped processing for large batches when enabled
-        // Threshold: use mmap when we have more than rows_per_file rows (i.e., multiple output files)
-        if self.use_memory_mapped_files && record_batch.num_rows() > rows_per_file {
+        // Use memory-mapped processing when enabled
+        // This reduces RAM usage by writing the batch to a temp file and memory-mapping it,
+        // allowing the original batch to be freed before encoding
+        if self.use_memory_mapped_files {
             return self.sort_and_split_batch_mmap(record_batch, rows_per_file);
         }
 
