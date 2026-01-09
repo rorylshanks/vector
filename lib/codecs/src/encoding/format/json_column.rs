@@ -337,9 +337,11 @@ impl JsonColumnProcessor {
         // ============================================================
         // PASS 1: Parallel key scanning (minimal memory - only keys and types)
         // Uses BorrowedValue to avoid allocating string copies
+        // with_min_len reduces rayon overhead by ensuring minimum work per thread
         // ============================================================
         let key_scan_results: Vec<SmallVec<[(String, InferredType); 32]>> = json_values
             .par_iter()
+            .with_min_len(256) // Minimum 256 rows per work unit to reduce sync overhead
             .map(|json_str| {
                 let mut keys = SmallVec::new();
                 if let Some(s) = json_str {
@@ -422,10 +424,59 @@ impl JsonColumnProcessor {
         }
 
         // ============================================================
-        // PASS 2: Chunked parallel parsing with incremental output building
-        // Processes rows in chunks to limit peak memory usage
+        // PASS 2: Single parallel pass for value extraction
+        // with_min_len reduces rayon sync overhead
         // ============================================================
         let num_builders = subcolumn_keys.len();
+
+        // Parse all rows in parallel in one pass (reduces synchronization overhead)
+        let parse_results: Vec<RowParseResult> = json_values
+            .par_iter()
+            .with_min_len(256) // Minimum 256 rows per work unit
+            .map(|json_str| {
+                let mut result = RowParseResult {
+                    subcolumn_values: SmallVec::new(),
+                    overflow_entries: SmallVec::new(),
+                    original: None,
+                };
+
+                match json_str {
+                    Some(s) if !s.is_empty() => {
+                        if keep_original {
+                            result.original = Some((*s).to_string());
+                        }
+
+                        let mut s_owned = s.to_string();
+                        if let Ok(simd_json::BorrowedValue::Object(ref obj)) =
+                            unsafe { simd_json::from_str::<simd_json::BorrowedValue>(&mut s_owned) }
+                        {
+                            let mut key_buffer = String::with_capacity(64);
+                            Self::extract_values(
+                                obj,
+                                "",
+                                0,
+                                max_depth,
+                                &mut key_buffer,
+                                &key_to_idx,
+                                &key_to_builder,
+                                &subcolumn_indices,
+                                &overflow_indices,
+                                &keys,
+                                &key_to_bucket,
+                                &mut result,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+
+                result
+            })
+            .collect();
+
+        // ============================================================
+        // Build final output from parse results (sequential - cache friendly)
+        // ============================================================
 
         // Initialize builders
         let mut subcolumn_builders: Vec<SubcolumnBuilder> = subcolumn_keys
@@ -451,91 +502,38 @@ impl JsonColumnProcessor {
         let mut row_values: Vec<Option<CompactValue>> = vec![None; num_builders];
         let mut row_has_good_value: Vec<bool> = vec![false; num_builders];
 
-        // Process in chunks to limit peak memory (chunk size trades off memory vs parallelism overhead)
-        const CHUNK_SIZE: usize = 500;
-        let mut global_row_idx = 0usize;
-
-        for chunk in json_values.chunks(CHUNK_SIZE) {
-            // Parse chunk in parallel using BorrowedValue
-            let chunk_results: Vec<RowParseResult> = chunk
-                .par_iter()
-                .map(|json_str| {
-                    let mut result = RowParseResult {
-                        subcolumn_values: SmallVec::new(),
-                        overflow_entries: SmallVec::new(),
-                        original: None,
-                    };
-
-                    match json_str {
-                        Some(s) if !s.is_empty() => {
-                            if keep_original {
-                                result.original = Some((*s).to_string());
-                            }
-
-                            let mut s_owned = s.to_string();
-                            if let Ok(simd_json::BorrowedValue::Object(ref obj)) =
-                                unsafe { simd_json::from_str::<simd_json::BorrowedValue>(&mut s_owned) }
-                            {
-                                let mut key_buffer = String::with_capacity(64);
-                                Self::extract_values(
-                                    obj,
-                                    "",
-                                    0,
-                                    max_depth,
-                                    &mut key_buffer,
-                                    &key_to_idx,
-                                    &key_to_builder,
-                                    &subcolumn_indices,
-                                    &overflow_indices,
-                                    &keys,
-                                    &key_to_bucket,
-                                    &mut result,
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    result
-                })
-                .collect();
-
-            // Process chunk results sequentially and immediately free memory
-            for parse_result in chunk_results {
-                // Store original
-                if keep_original {
-                    original_values.push(parse_result.original);
-                }
-
-                // Reset row state
-                row_values.iter_mut().for_each(|x| *x = None);
-                row_has_good_value.iter_mut().for_each(|x| *x = false);
-
-                // Collect subcolumn values (first non-null wins)
-                for (builder_idx, value) in parse_result.subcolumn_values {
-                    let is_good = !value.is_null_or_empty();
-                    if row_values[builder_idx].is_none() || (!row_has_good_value[builder_idx] && is_good) {
-                        row_values[builder_idx] = Some(value);
-                        row_has_good_value[builder_idx] = is_good;
-                    }
-                }
-
-                // Push to builders
-                for (builder_idx, builder) in subcolumn_builders.iter_mut().enumerate() {
-                    builder.push(row_values[builder_idx].as_ref());
-                }
-
-                // Handle overflow entries - look up key by index
-                for (bucket_idx, key_idx, value) in parse_result.overflow_entries {
-                    bucket_maps[bucket_idx]
-                        .entry(global_row_idx)
-                        .or_default()
-                        .insert(keys[key_idx].clone(), value.to_string_value());
-                }
-
-                global_row_idx += 1;
+        // Process parse results sequentially (cache-friendly linear access)
+        for (row_idx, parse_result) in parse_results.into_iter().enumerate() {
+            // Store original
+            if keep_original {
+                original_values.push(parse_result.original);
             }
-            // chunk_results is dropped here, freeing memory before processing next chunk
+
+            // Reset row state
+            row_values.iter_mut().for_each(|x| *x = None);
+            row_has_good_value.iter_mut().for_each(|x| *x = false);
+
+            // Collect subcolumn values (first non-null wins)
+            for (builder_idx, value) in parse_result.subcolumn_values {
+                let is_good = !value.is_null_or_empty();
+                if row_values[builder_idx].is_none() || (!row_has_good_value[builder_idx] && is_good) {
+                    row_values[builder_idx] = Some(value);
+                    row_has_good_value[builder_idx] = is_good;
+                }
+            }
+
+            // Push to builders
+            for (builder_idx, builder) in subcolumn_builders.iter_mut().enumerate() {
+                builder.push(row_values[builder_idx].as_ref());
+            }
+
+            // Handle overflow entries - look up key by index
+            for (bucket_idx, key_idx, value) in parse_result.overflow_entries {
+                bucket_maps[bucket_idx]
+                    .entry(row_idx)
+                    .or_default()
+                    .insert(keys[key_idx].clone(), value.to_string_value());
+            }
         }
 
         // Finalize subcolumns
