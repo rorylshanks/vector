@@ -817,14 +817,9 @@ impl ParquetSerializer {
         // Build the full record batch
         let record_batch = build_record_batch(Arc::clone(&schema), &events)?;
 
-        // If JSON column processors are configured, expand JSON columns
-        let record_batch = if let Some(processors) = &self.json_column_processors {
-            expand_json_columns(record_batch, processors, &events)?
-        } else {
-            record_batch
-        };
-
         // Sort (if configured) and split the record batch
+        // JSON column expansion is done per-chunk in sort_and_split_batch to avoid
+        // memory overflow when accumulating large amounts of string data
         self.sort_and_split_batch(record_batch, rows_per_file)
     }
 
@@ -926,6 +921,15 @@ impl ParquetSerializer {
             } else {
                 // No sorting, just slice the batch
                 batch.slice(start, chunk_len)
+            };
+
+            // Expand JSON columns on this chunk if processors are configured
+            // This is done per-chunk to avoid memory overflow from accumulating
+            // large amounts of string data in Arrow builders (which use i32 offsets)
+            let chunk_batch = if let Some(processors) = &self.json_column_processors {
+                expand_json_columns(chunk_batch, processors, &[])?
+            } else {
+                chunk_batch
             };
 
             // Encode this chunk to Parquet
