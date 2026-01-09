@@ -1169,7 +1169,7 @@ fn expand_json_columns(
     processors: &[JsonColumnProcessor],
     _events: &[Event],
 ) -> Result<arrow::array::RecordBatch, ParquetEncodingError> {
-    use arrow::array::{Array, RecordBatch, StringArray};
+    use arrow::array::{Array, LargeStringArray, RecordBatch, StringArray};
     use arrow::datatypes::{Field, Schema};
 
     let schema = record_batch.schema();
@@ -1194,19 +1194,33 @@ fn expand_json_columns(
         if let Some(col_idx) = schema.fields().iter().position(|f| f.name() == column_name) {
             let array = record_batch.column(col_idx);
 
-            // Try to cast to StringArray
-            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-                // Extract string values
-                let json_values: Vec<Option<&str>> = (0..num_rows)
-                    .map(|i| {
-                        if string_array.is_null(i) {
-                            None
-                        } else {
-                            Some(string_array.value(i))
-                        }
-                    })
-                    .collect();
+            // Try to cast to StringArray or LargeStringArray
+            let json_values: Option<Vec<Option<&str>>> =
+                if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                    Some((0..num_rows)
+                        .map(|i| {
+                            if string_array.is_null(i) {
+                                None
+                            } else {
+                                Some(string_array.value(i))
+                            }
+                        })
+                        .collect())
+                } else if let Some(large_string_array) = array.as_any().downcast_ref::<LargeStringArray>() {
+                    Some((0..num_rows)
+                        .map(|i| {
+                            if large_string_array.is_null(i) {
+                                None
+                            } else {
+                                Some(large_string_array.value(i))
+                            }
+                        })
+                        .collect())
+                } else {
+                    None
+                };
 
+            if let Some(json_values) = json_values {
                 // Process the JSON column
                 let processed = processor.process_batch(json_values.into_iter());
                 processed_columns.push(processed);
