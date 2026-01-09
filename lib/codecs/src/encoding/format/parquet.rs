@@ -340,36 +340,6 @@ pub struct ParquetSerializerConfig {
     /// ```
     #[serde(default)]
     pub json_columns: Option<Vec<JsonColumnConfig>>,
-
-    /// Use memory-mapped temporary files for large batch processing.
-    ///
-    /// When enabled (default), super-batch mode writes intermediate Arrow data to
-    /// memory-mapped temporary files instead of keeping everything in RAM. This
-    /// significantly reduces memory usage for large batches (e.g., 100k events)
-    /// while maintaining sorting capabilities across the entire batch.
-    ///
-    /// **How it works:**
-    /// 1. Events are converted to an Arrow RecordBatch
-    /// 2. The RecordBatch is written to a temporary Arrow IPC file
-    /// 3. The file is memory-mapped for efficient random access
-    /// 4. Sorting indices are computed (in memory, ~8 bytes per row)
-    /// 5. Each output file's data is read from mmap and processed
-    ///
-    /// **Memory savings:**
-    /// For a batch of 100k events at ~70KB each:
-    /// - Without mmap: ~7GB RAM for data + sorting
-    /// - With mmap: ~800KB for indices + OS page cache
-    ///
-    /// **Trade-offs:**
-    /// - Slightly higher latency due to disk I/O (typically <5% slower)
-    /// - Requires write access to system temp directory
-    /// - OS page cache handles caching automatically
-    ///
-    /// Disable only if you have sufficient RAM and want to avoid temp file I/O.
-    #[serde(default = "default_use_memory_mapped_files")]
-    #[configurable(metadata(docs::examples = true))]
-    #[configurable(metadata(docs::examples = false))]
-    pub use_memory_mapped_files: bool,
 }
 
 impl Default for ParquetSerializerConfig {
@@ -387,7 +357,6 @@ impl Default for ParquetSerializerConfig {
             sorting_columns: None,
             rows_per_file: None,
             json_columns: None,
-            use_memory_mapped_files: default_use_memory_mapped_files(),
         }
     }
 }
@@ -517,10 +486,6 @@ fn default_keep_original_column() -> bool {
     true
 }
 
-fn default_use_memory_mapped_files() -> bool {
-    true
-}
-
 fn type_hints_example() -> BTreeMap<String, JsonTypeHint> {
     let mut hints = BTreeMap::new();
     hints.insert("user.age".to_string(), JsonTypeHint::Int64);
@@ -601,7 +566,6 @@ impl ParquetSerializerConfig {
             sorting_columns: None,
             rows_per_file: None,
             json_columns: None,
-            use_memory_mapped_files: default_use_memory_mapped_files(),
         }
     }
 
@@ -664,10 +628,6 @@ pub struct ParquetSerializer {
     rows_per_file: Option<usize>,
     /// JSON column processors for expanding JSON columns into subcolumns
     json_column_processors: Option<Vec<JsonColumnProcessor>>,
-    /// Use memory-mapped files for large batch processing
-    use_memory_mapped_files: bool,
-    /// Directory for memory-mapped temp files (defaults to system temp dir)
-    data_dir: Option<std::path::PathBuf>,
 }
 
 impl ParquetSerializer {
@@ -807,17 +767,7 @@ impl ParquetSerializer {
             sorting_columns: config.sorting_columns,
             rows_per_file: config.rows_per_file,
             json_column_processors,
-            use_memory_mapped_files: config.use_memory_mapped_files,
-            data_dir: None,
         })
-    }
-
-    /// Set the data directory for memory-mapped temp files.
-    ///
-    /// When set, mmap temp files will be created in a `parquet_temp` subdirectory
-    /// of the specified path. If not set, falls back to the system temp directory.
-    pub fn set_data_dir(&mut self, data_dir: Option<std::path::PathBuf>) {
-        self.data_dir = data_dir;
     }
 
     /// Returns true if JSON column expansion is enabled
@@ -842,10 +792,6 @@ impl ParquetSerializer {
     ///
     /// Memory efficiency: Sorting uses Arrow's index-based approach to avoid copying data.
     /// Each chunk is materialized and written separately to minimize peak memory usage.
-    ///
-    /// When `use_memory_mapped_files` is enabled (default), the record batch is written
-    /// to a temporary Arrow IPC file and memory-mapped, significantly reducing RAM usage
-    /// for large batches while maintaining global sorting capabilities.
     pub fn encode_batch_split(
         &self,
         events: Vec<Event>,
@@ -871,12 +817,8 @@ impl ParquetSerializer {
         // Build the full record batch
         let record_batch = build_record_batch(Arc::clone(&schema), &events)?;
 
-        // Use memory-mapped processing when enabled
-        // This reduces RAM usage by writing the batch to a temp file and memory-mapping it,
-        // allowing the original batch to be freed before encoding
-        if self.use_memory_mapped_files {
-            return self.sort_and_split_batch_mmap(record_batch, rows_per_file);
-        }
+        // Drop the original events to free memory - the RecordBatch now owns all the data
+        drop(events);
 
         // Sort (if configured) and split the record batch
         // JSON column expansion is done per-chunk in sort_and_split_batch so each
@@ -1015,224 +957,6 @@ impl ParquetSerializer {
                 encode_record_batch_to_parquet(&chunk_batch, &self.writer_properties)
             })
             .collect();
-
-        parquet_files
-    }
-
-    /// Sort and split using memory-mapped temp files for reduced RAM usage.
-    ///
-    /// This method writes the record batch to a temporary Arrow IPC file,
-    /// memory-maps it, and processes chunks directly from disk. This significantly
-    /// reduces memory usage for large batches while maintaining global sorting.
-    ///
-    /// Memory usage:
-    /// - Sort indices: ~8 bytes per row (e.g., 800KB for 100k rows)
-    /// - Chunk processing: only one chunk's worth of data in memory at a time
-    /// - OS page cache handles efficient disk I/O automatically
-    fn sort_and_split_batch_mmap(
-        &self,
-        batch: arrow::array::RecordBatch,
-        rows_per_file: usize,
-    ) -> Result<Vec<Bytes>, ParquetEncodingError> {
-        use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
-        use arrow::ipc::reader::FileReader;
-        use arrow::ipc::writer::FileWriter;
-        use std::fs::File;
-
-        let num_rows = batch.num_rows();
-        let schema = batch.schema();
-
-        // Determine temp directory: use data_dir/parquet_temp if set, else system temp
-        let temp_dir = match &self.data_dir {
-            Some(data_dir) => {
-                let parquet_temp = data_dir.join("parquet_temp");
-                // Create the directory if it doesn't exist
-                if let Err(e) = std::fs::create_dir_all(&parquet_temp) {
-                    tracing::warn!(
-                        error = %e,
-                        path = %parquet_temp.display(),
-                        "Failed to create parquet temp directory, falling back to system temp"
-                    );
-                    None
-                } else {
-                    Some(parquet_temp)
-                }
-            }
-            None => None,
-        };
-
-        // Create a temp file for the Arrow IPC data
-        let temp_file = match &temp_dir {
-            Some(dir) => tempfile::Builder::new()
-                .prefix("arrow_batch_")
-                .suffix(".arrow")
-                .tempfile_in(dir)?,
-            None => tempfile::Builder::new()
-                .prefix("arrow_batch_")
-                .suffix(".arrow")
-                .tempfile()?,
-        };
-
-        let temp_path = temp_file.path().to_path_buf();
-
-        tracing::debug!(
-            path = %temp_path.display(),
-            num_rows = num_rows,
-            "Writing record batch to temp file for mmap processing"
-        );
-
-        // Write the record batch to the temp file
-        {
-            let file = temp_file.as_file();
-            let mut writer = FileWriter::try_new(file, &schema)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            writer
-                .write(&batch)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            writer
-                .finish()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        }
-
-        // Drop the original batch to free memory before mmap
-        drop(batch);
-
-        // Memory-map the file and read the batch back
-        let file = File::open(&temp_path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-
-        // Create a reader from the mmap'd data
-        let cursor = std::io::Cursor::new(&mmap[..]);
-        let reader = FileReader::try_new(cursor, None)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        // Read the batch from mmap (this is zero-copy - data stays in mmap)
-        let mmap_batches: Vec<_> = reader
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-
-        if mmap_batches.is_empty() {
-            return Err(ParquetEncodingError::NoEvents);
-        }
-
-        // We only wrote one batch, so there should be exactly one
-        let mmap_batch = &mmap_batches[0];
-        let schema = mmap_batch.schema();
-
-        // Compute sorted indices (this is the only allocation proportional to num_rows)
-        let sorted_indices = if let Some(sorting_cols) = &self.sorting_columns {
-            let sort_columns: Vec<SortColumn> = sorting_cols
-                .iter()
-                .filter_map(|col_config| {
-                    schema
-                        .fields()
-                        .iter()
-                        .position(|f| f.name() == &col_config.column)
-                        .map(|idx| SortColumn {
-                            values: Arc::clone(mmap_batch.column(idx)),
-                            options: Some(SortOptions {
-                                descending: col_config.descending,
-                                nulls_first: false,
-                            }),
-                        })
-                })
-                .collect();
-
-            if sort_columns.is_empty() {
-                None
-            } else {
-                Some(
-                    lexsort_to_indices(&sort_columns, None)
-                        .map_err(|e| ParquetEncodingError::RecordBatchCreation {
-                            source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
-                        })?,
-                )
-            }
-        } else {
-            None
-        };
-
-        let num_files = (num_rows + rows_per_file - 1) / rows_per_file;
-
-        tracing::debug!(
-            num_files = num_files,
-            rows_per_file = rows_per_file,
-            rayon_threads = rayon::current_num_threads(),
-            "Processing mmap'd batch into parquet files"
-        );
-
-        // Advise the OS to prefetch the mmap'd data to reduce page fault latency during parallel access
-        #[cfg(unix)]
-        unsafe {
-            libc::posix_madvise(
-                mmap.as_ptr() as *mut libc::c_void,
-                mmap.len(),
-                libc::POSIX_MADV_WILLNEED,
-            );
-        }
-
-        // Process chunks in parallel
-        // Each chunk is a separate work unit (with_min_len(1)) to ensure maximum parallelism
-        use rayon::prelude::*;
-
-        let parquet_files: Result<Vec<Bytes>, ParquetEncodingError> = (0..num_files)
-            .into_par_iter()
-            .with_min_len(1) // Each file should be processed as a separate work unit
-            .map(|chunk_idx| {
-                let start = chunk_idx * rows_per_file;
-                let end = std::cmp::min(start + rows_per_file, num_rows);
-                let chunk_len = end - start;
-
-                tracing::trace!(
-                    chunk_idx = chunk_idx,
-                    thread_id = ?std::thread::current().id(),
-                    rows = chunk_len,
-                    "Processing parquet chunk"
-                );
-
-                // Extract the chunk using sorted indices if available
-                let chunk_batch = if let Some(ref indices) = sorted_indices {
-                    let chunk_indices = indices.slice(start, chunk_len);
-
-                    let chunk_columns: Result<Vec<_>, _> = mmap_batch
-                        .columns()
-                        .iter()
-                        .map(|col| take(col.as_ref(), &chunk_indices, None))
-                        .collect();
-
-                    let chunk_columns = chunk_columns.map_err(|e| {
-                        ParquetEncodingError::RecordBatchCreation {
-                            source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
-                        }
-                    })?;
-
-                    arrow::array::RecordBatch::try_new(Arc::clone(&schema), chunk_columns).map_err(
-                        |e| ParquetEncodingError::RecordBatchCreation {
-                            source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
-                        },
-                    )?
-                } else {
-                    mmap_batch.slice(start, chunk_len)
-                };
-
-                // Expand JSON columns on this chunk if processors are configured
-                let chunk_batch = if let Some(processors) = &self.json_column_processors {
-                    expand_json_columns(chunk_batch, processors, &[])?
-                } else {
-                    chunk_batch
-                };
-
-                // Encode this chunk to Parquet
-                encode_record_batch_to_parquet(&chunk_batch, &self.writer_properties)
-            })
-            .collect();
-
-        // Temp file is automatically deleted when temp_file goes out of scope
-        tracing::debug!(
-            path = %temp_path.display(),
-            "Finished mmap processing, temp file will be deleted"
-        );
 
         parquet_files
     }

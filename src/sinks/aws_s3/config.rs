@@ -248,11 +248,7 @@ impl S3SinkConfig {
 
         let partitioner = S3KeyPartitioner::new(key_prefix, ssekms_key_id, None);
 
-        let (transformer, mut encoder) = self.encoding.build_encoder(SinkType::MessageBased)?;
-
-        // Set data directory for memory-mapped temp files (used by Parquet super-batch mode)
-        #[cfg(feature = "codecs-parquet")]
-        encoder.set_data_dir(cx.globals.data_dir.clone());
+        let (transformer, encoder) = self.encoding.build_encoder(SinkType::MessageBased)?;
 
         let request_options = S3RequestOptions {
             bucket: self.bucket.clone(),

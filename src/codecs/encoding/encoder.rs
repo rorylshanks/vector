@@ -105,16 +105,6 @@ impl BatchEncoder {
         }
     }
 
-    /// Set the data directory for memory-mapped temp files (Parquet only).
-    ///
-    /// When set, mmap temp files will be created in the specified directory.
-    /// Only affects Parquet serializer; no-op for other serializers.
-    #[cfg(feature = "codecs-parquet")]
-    pub fn set_data_dir(&mut self, data_dir: Option<std::path::PathBuf>) {
-        if let BatchSerializer::Parquet(serializer) = &mut self.serializer {
-            serializer.set_data_dir(data_dir);
-        }
-    }
 }
 
 impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
@@ -194,17 +184,6 @@ impl EncoderKind {
                 "Super-batch mode is only supported for batch encoders",
             )))),
             EncoderKind::Batch(encoder) => encoder.encode_batch_split(events),
-        }
-    }
-
-    /// Set the data directory for memory-mapped temp files (Parquet only).
-    ///
-    /// When set, mmap temp files will be created in the specified directory.
-    /// Only affects Parquet batch encoder; no-op for framed encoders.
-    #[cfg(feature = "codecs-parquet")]
-    pub fn set_data_dir(&mut self, data_dir: Option<std::path::PathBuf>) {
-        if let EncoderKind::Batch(encoder) = self {
-            encoder.set_data_dir(data_dir);
         }
     }
 }
