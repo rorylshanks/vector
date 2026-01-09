@@ -2607,6 +2607,7 @@ dependencies = [
  "futures 0.3.31",
  "indoc",
  "influxdb-line-protocol",
+ "libc",
  "memchr",
  "memmap2",
  "murmur3",

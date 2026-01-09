@@ -24,7 +24,7 @@ pub use format::{OtlpSerializer, OtlpSerializerConfig};
 #[cfg(feature = "parquet")]
 pub use format::{
     JsonColumnConfig, JsonTypeHint, ParquetCompression, ParquetEncodingError, ParquetSerializer,
-    ParquetSerializerConfig,
+    ParquetSerializerConfig, SortingColumnConfig,
 };
 #[cfg(any(feature = "arrow", feature = "parquet"))]
 pub use format::{SchemaDefinition, SchemaDefinitionError};

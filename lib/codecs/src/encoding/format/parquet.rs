@@ -948,16 +948,31 @@ impl ParquetSerializer {
         // Calculate number of files needed
         let num_files = (num_rows + rows_per_file - 1) / rows_per_file;
 
+        tracing::debug!(
+            num_files = num_files,
+            rows_per_file = rows_per_file,
+            rayon_threads = rayon::current_num_threads(),
+            "Processing batch into parquet files (in-memory mode)"
+        );
+
         // Process chunks in parallel using rayon
         // Each chunk is independent: extract rows, expand JSON, encode to Parquet
         use rayon::prelude::*;
 
         let parquet_files: Result<Vec<Bytes>, ParquetEncodingError> = (0..num_files)
             .into_par_iter()
+            .with_min_len(1) // Each file should be processed as a separate work unit
             .map(|chunk_idx| {
                 let start = chunk_idx * rows_per_file;
                 let end = std::cmp::min(start + rows_per_file, num_rows);
                 let chunk_len = end - start;
+
+                tracing::trace!(
+                    chunk_idx = chunk_idx,
+                    thread_id = ?std::thread::current().id(),
+                    rows = chunk_len,
+                    "Processing parquet chunk"
+                );
 
                 // Extract the chunk using sorted indices if available
                 let chunk_batch = if let Some(ref indices) = sorted_indices {
@@ -1142,19 +1157,38 @@ impl ParquetSerializer {
         tracing::debug!(
             num_files = num_files,
             rows_per_file = rows_per_file,
+            rayon_threads = rayon::current_num_threads(),
             "Processing mmap'd batch into parquet files"
         );
 
+        // Advise the OS to prefetch the mmap'd data to reduce page fault latency during parallel access
+        #[cfg(unix)]
+        unsafe {
+            libc::posix_madvise(
+                mmap.as_ptr() as *mut libc::c_void,
+                mmap.len(),
+                libc::POSIX_MADV_WILLNEED,
+            );
+        }
+
         // Process chunks in parallel
-        // Each thread reads its chunk from the mmap'd data
+        // Each chunk is a separate work unit (with_min_len(1)) to ensure maximum parallelism
         use rayon::prelude::*;
 
         let parquet_files: Result<Vec<Bytes>, ParquetEncodingError> = (0..num_files)
             .into_par_iter()
+            .with_min_len(1) // Each file should be processed as a separate work unit
             .map(|chunk_idx| {
                 let start = chunk_idx * rows_per_file;
                 let end = std::cmp::min(start + rows_per_file, num_rows);
                 let chunk_len = end - start;
+
+                tracing::trace!(
+                    chunk_idx = chunk_idx,
+                    thread_id = ?std::thread::current().id(),
+                    rows = chunk_len,
+                    "Processing parquet chunk"
+                );
 
                 // Extract the chunk using sorted indices if available
                 let chunk_batch = if let Some(ref indices) = sorted_indices {
