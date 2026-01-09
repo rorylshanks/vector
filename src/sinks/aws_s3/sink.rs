@@ -286,9 +286,9 @@ impl IncrementalRequestBuilder<(S3PartitionKey, Vec<Event>)> for S3SuperBatchReq
         let request_metadata_builder = RequestMetadataBuilder::new(
             event_count,
             uncompressed_size,
-            events_byte_size,
+            events_byte_size.clone(),
         );
-        let encode_result = EncodeResult::uncompressed(payload, telemetry().create_request_count_byte_size());
+        let encode_result = EncodeResult::uncompressed(payload, events_byte_size);
         let request_metadata = request_metadata_builder.build(&encode_result);
 
         S3Request {
