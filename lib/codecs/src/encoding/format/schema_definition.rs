@@ -129,9 +129,8 @@ impl SchemaDefinition {
 /// Parse a data type string into an Arrow DataType
 fn parse_data_type(type_str: &str, field_name: &str) -> Result<DataType, SchemaDefinitionError> {
     let data_type = match type_str.to_lowercase().as_str() {
-        // String types
-        "utf8" | "string" => DataType::Utf8,
-        "large_utf8" | "large_string" => DataType::LargeUtf8,
+        // String types - use LargeUtf8 by default to avoid i32 offset overflow
+        "utf8" | "string" | "large_utf8" | "large_string" => DataType::LargeUtf8,
 
         // Integer types
         "int8" => DataType::Int8,

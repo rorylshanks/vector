@@ -818,8 +818,8 @@ impl ParquetSerializer {
         let record_batch = build_record_batch(Arc::clone(&schema), &events)?;
 
         // Sort (if configured) and split the record batch
-        // JSON column expansion is done per-chunk in sort_and_split_batch to avoid
-        // memory overflow when accumulating large amounts of string data
+        // JSON column expansion is done per-chunk in sort_and_split_batch so each
+        // parquet file has its own schema based on that chunk's data
         self.sort_and_split_batch(record_batch, rows_per_file)
     }
 
@@ -924,8 +924,7 @@ impl ParquetSerializer {
             };
 
             // Expand JSON columns on this chunk if processors are configured
-            // This is done per-chunk to avoid memory overflow from accumulating
-            // large amounts of string data in Arrow builders (which use i32 offsets)
+            // Each chunk gets its own JSON-expanded schema based on that chunk's data
             let chunk_batch = if let Some(processors) = &self.json_column_processors {
                 expand_json_columns(chunk_batch, processors, &[])?
             } else {
@@ -1056,15 +1055,15 @@ fn infer_arrow_type(value: &vector_core::event::Value) -> arrow::datatypes::Data
     use vector_core::event::Value;
 
     match value {
-        Value::Bytes(_) => DataType::Utf8,
+        Value::Bytes(_) => DataType::LargeUtf8,
         Value::Integer(_) => DataType::Int64,
         Value::Float(_) => DataType::Float64,
         Value::Boolean(_) => DataType::Boolean,
         Value::Timestamp(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
         // Nested types and regex are always serialized as strings
-        Value::Array(_) | Value::Object(_) | Value::Regex(_) => DataType::Utf8,
-        // Null doesn't determine type, default to Utf8
-        Value::Null => DataType::Utf8,
+        Value::Array(_) | Value::Object(_) | Value::Regex(_) => DataType::LargeUtf8,
+        // Null doesn't determine type, default to LargeUtf8
+        Value::Null => DataType::LargeUtf8,
     }
 }
 
@@ -1128,7 +1127,7 @@ fn infer_schema_from_events(
                         column = %key_str,
                         existing_type = ?existing_type,
                         new_type = ?inferred_type,
-                        "Type conflict detected, encoding as Utf8"
+                        "Type conflict detected, encoding as LargeUtf8"
                     );
 
                     type_conflicts
@@ -1136,7 +1135,7 @@ fn infer_schema_from_events(
                         .or_insert_with(|| vec![existing_type.clone()])
                         .push(inferred_type);
 
-                    field_types.insert(key_str, DataType::Utf8);
+                    field_types.insert(key_str, DataType::LargeUtf8);
                 }
                 Some(_) => {
                     // Same type, no action needed
@@ -1247,7 +1246,7 @@ fn expand_json_columns(
     for processed in &processed_columns {
         // Add original column if kept
         if let Some((name, array)) = processed.original_to_array() {
-            new_fields.push(Arc::new(Field::new(&name, DataType::Utf8, true)));
+            new_fields.push(Arc::new(Field::new(&name, DataType::LargeUtf8, true)));
             new_arrays.push(array);
         }
 

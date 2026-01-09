@@ -268,7 +268,7 @@ pub fn build_record_batch(
             DataType::Timestamp(time_unit, _) => {
                 build_timestamp_array(events, field_name, *time_unit, nullable)?
             }
-            DataType::Utf8 => build_string_array(events, field_name, nullable)?,
+            DataType::Utf8 | DataType::LargeUtf8 => build_string_array(events, field_name, nullable)?,
             DataType::Int8 => build_int8_array(events, field_name, nullable)?,
             DataType::Int16 => build_int16_array(events, field_name, nullable)?,
             DataType::Int32 => build_int32_array(events, field_name, nullable)?,
