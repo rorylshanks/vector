@@ -8,7 +8,7 @@ use arrow::{
     array::{
         ArrayRef, BinaryBuilder, BooleanBuilder, Decimal128Builder, Decimal256Builder,
         Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
-        StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+        LargeStringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
         TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
         UInt32Builder, UInt64Builder,
     },
@@ -423,7 +423,8 @@ fn build_string_array(
     field_name: &str,
     nullable: bool,
 ) -> Result<ArrayRef, ArrowEncodingError> {
-    let mut builder = StringBuilder::with_capacity(events.len(), 0);
+    // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
+    let mut builder = LargeStringBuilder::with_capacity(events.len(), 0);
 
     for event in events {
         if let Event::Log(log) = event {

@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, LargeStringBuilder, MapBuilder,
-    StringBuilder, UInt64Builder,
+    UInt64Builder,
 };
 
 use super::parquet::{JsonColumnConfig, JsonTypeHint};
@@ -159,7 +159,8 @@ impl SubcolumnData {
     pub fn to_arrow_array(&self) -> ArrayRef {
         match self {
             SubcolumnData::String(values) => {
-                let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 32);
+                // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
+                let mut builder = LargeStringBuilder::with_capacity(values.len(), values.len() * 32);
                 for value in values {
                     match value {
                         Some(v) => builder.append_value(v),
@@ -609,7 +610,8 @@ impl ProcessedJsonColumns {
     /// Convert original values to Arrow array
     pub fn original_to_array(&self) -> Option<(String, ArrayRef)> {
         self.original_values.as_ref().map(|values| {
-            let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 100);
+            // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
+            let mut builder = LargeStringBuilder::with_capacity(values.len(), values.len() * 100);
             for value in values {
                 match value {
                     Some(v) => builder.append_value(v),
