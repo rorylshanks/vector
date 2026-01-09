@@ -19,6 +19,7 @@ parquet = { version = "56.2.0", default-features = false, features = ["arrow", "
 rayon = { version = "1.10", optional = true }
 simd-json = { version = "0.14", optional = true }
 murmur3 = { version = "0.5.2", optional = true }
+ahash = { version = "0.8", optional = true }
 async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -68,6 +69,6 @@ vrl.workspace = true
 
 [features]
 arrow = []
-parquet = ["dep:parquet", "arrow", "dep:rayon", "dep:simd-json", "dep:murmur3"]
+parquet = ["dep:parquet", "arrow", "dep:rayon", "dep:simd-json", "dep:murmur3", "dep:ahash"]
 opentelemetry = ["dep:opentelemetry-proto"]
 syslog = ["dep:syslog_loose", "dep:strum", "dep:derive_more", "dep:serde-aux", "dep:toml"]

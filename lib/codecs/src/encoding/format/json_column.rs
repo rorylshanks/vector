@@ -2,11 +2,20 @@
 //!
 //! This module provides functionality to expand JSON string columns into
 //! individual subcolumns for efficient columnar storage, similar to ClickHouse's JSON type.
+//!
+//! Performance optimizations:
+//! - Two-pass approach to minimize memory usage
+//! - AHashMap for faster internal hashing
+//! - MurmurHash3 for bucket assignment (consistent hashing)
+//! - Parallel processing with rayon
+//! - String interning to avoid allocations
 
-use std::collections::{BTreeMap, HashMap};
-use std::rc::Rc;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, LargeStringBuilder, MapBuilder,
@@ -27,25 +36,25 @@ enum CompactValue {
 }
 
 impl CompactValue {
-    /// Convert from simd_json owned value
+    /// Convert from simd_json borrowed value (zero-copy for primitives, copy only for strings)
     #[inline]
-    fn from_simd_owned(value: simd_json::OwnedValue) -> Self {
-        use simd_json::OwnedValue;
+    fn from_simd_borrowed(value: &simd_json::BorrowedValue<'_>) -> Self {
+        use simd_json::BorrowedValue;
         match value {
-            OwnedValue::Static(simd_json::StaticNode::Null) => CompactValue::Null,
-            OwnedValue::Static(simd_json::StaticNode::Bool(b)) => CompactValue::Bool(b),
-            OwnedValue::Static(simd_json::StaticNode::I64(i)) => CompactValue::Int(i),
-            OwnedValue::Static(simd_json::StaticNode::U64(u)) => {
-                if u > i64::MAX as u64 {
+            BorrowedValue::Static(simd_json::StaticNode::Null) => CompactValue::Null,
+            BorrowedValue::Static(simd_json::StaticNode::Bool(b)) => CompactValue::Bool(*b),
+            BorrowedValue::Static(simd_json::StaticNode::I64(i)) => CompactValue::Int(*i),
+            BorrowedValue::Static(simd_json::StaticNode::U64(u)) => {
+                if *u > i64::MAX as u64 {
                     CompactValue::String(u.to_string())
                 } else {
-                    CompactValue::Uint(u)
+                    CompactValue::Uint(*u)
                 }
             }
-            OwnedValue::Static(simd_json::StaticNode::F64(f)) => CompactValue::Float(f),
-            OwnedValue::String(s) => CompactValue::String(s),
-            OwnedValue::Array(_) | OwnedValue::Object(_) => {
-                CompactValue::String(simd_json::to_string(&value).unwrap_or_default())
+            BorrowedValue::Static(simd_json::StaticNode::F64(f)) => CompactValue::Float(*f),
+            BorrowedValue::String(s) => CompactValue::String(s.to_string()),
+            BorrowedValue::Array(_) | BorrowedValue::Object(_) => {
+                CompactValue::String(simd_json::to_string(value).unwrap_or_default())
             }
         }
     }
@@ -60,28 +69,10 @@ impl CompactValue {
     }
 
     #[inline]
-    fn infer_type(&self) -> InferredType {
-        match self {
-            CompactValue::Null => InferredType::Null,
-            CompactValue::Bool(_) => InferredType::Boolean,
-            CompactValue::Int(_) => InferredType::Int64,
-            CompactValue::Uint(u) => {
-                if *u > i64::MAX as u64 {
-                    InferredType::String
-                } else {
-                    InferredType::Uint64
-                }
-            }
-            CompactValue::Float(_) => InferredType::Float64,
-            CompactValue::String(_) => InferredType::String,
-        }
-    }
-
-    #[inline]
-    fn to_string(&self) -> String {
+    fn to_string_value(&self) -> String {
         match self {
             CompactValue::Null => String::new(),
-            CompactValue::Bool(b) => b.to_string(),
+            CompactValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             CompactValue::Int(i) => i.to_string(),
             CompactValue::Uint(u) => u.to_string(),
             CompactValue::Float(f) => f.to_string(),
@@ -139,8 +130,7 @@ pub struct ProcessedJsonColumns {
     /// Subcolumns with their flattened keys and values
     pub subcolumns: BTreeMap<String, SubcolumnData>,
     /// Bucket maps for overflow keys - sparse storage: bucket_index -> (row_index -> (key -> value))
-    /// Only rows with overflow data are stored, saving memory when most rows have no overflow
-    pub bucket_maps: Vec<HashMap<usize, HashMap<String, String>>>,
+    pub bucket_maps: Vec<AHashMap<usize, AHashMap<String, String>>>,
     /// Number of buckets
     pub bucket_count: usize,
     /// Total number of rows (needed for generating arrays)
@@ -162,7 +152,6 @@ impl SubcolumnData {
     pub fn to_arrow_array(&self) -> ArrayRef {
         match self {
             SubcolumnData::String(values) => {
-                // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
                 let mut builder = LargeStringBuilder::with_capacity(values.len(), values.len() * 32);
                 for value in values {
                     match value {
@@ -170,7 +159,7 @@ impl SubcolumnData {
                         None => builder.append_null(),
                     }
                 }
-                std::sync::Arc::new(builder.finish())
+                Arc::new(builder.finish())
             }
             SubcolumnData::Int64(values) => {
                 let mut builder = Int64Builder::with_capacity(values.len());
@@ -180,7 +169,7 @@ impl SubcolumnData {
                         None => builder.append_null(),
                     }
                 }
-                std::sync::Arc::new(builder.finish())
+                Arc::new(builder.finish())
             }
             SubcolumnData::Uint64(values) => {
                 let mut builder = UInt64Builder::with_capacity(values.len());
@@ -190,7 +179,7 @@ impl SubcolumnData {
                         None => builder.append_null(),
                     }
                 }
-                std::sync::Arc::new(builder.finish())
+                Arc::new(builder.finish())
             }
             SubcolumnData::Float64(values) => {
                 let mut builder = Float64Builder::with_capacity(values.len());
@@ -200,7 +189,7 @@ impl SubcolumnData {
                         None => builder.append_null(),
                     }
                 }
-                std::sync::Arc::new(builder.finish())
+                Arc::new(builder.finish())
             }
             SubcolumnData::Boolean(values) => {
                 let mut builder = BooleanBuilder::with_capacity(values.len());
@@ -210,7 +199,7 @@ impl SubcolumnData {
                         None => builder.append_null(),
                     }
                 }
-                std::sync::Arc::new(builder.finish())
+                Arc::new(builder.finish())
             }
         }
     }
@@ -229,6 +218,7 @@ enum InferredType {
 
 impl InferredType {
     /// Resolve type conflicts by finding a common type
+    #[inline]
     fn resolve_conflict(self, other: InferredType) -> InferredType {
         use InferredType::*;
         match (self, other) {
@@ -241,8 +231,8 @@ impl InferredType {
     }
 }
 
-/// Builder for subcolumn data that collects values efficiently
-enum SubcolumnBuilderCompact {
+/// Thread-safe builder for subcolumn data
+enum SubcolumnBuilder {
     String(Vec<Option<String>>),
     Int64(Vec<Option<i64>>),
     Uint64(Vec<Option<u64>>),
@@ -250,35 +240,35 @@ enum SubcolumnBuilderCompact {
     Boolean(Vec<Option<bool>>),
 }
 
-impl SubcolumnBuilderCompact {
+impl SubcolumnBuilder {
     fn new(inferred_type: InferredType, capacity: usize) -> Self {
         match inferred_type {
             InferredType::String | InferredType::Null => {
-                SubcolumnBuilderCompact::String(Vec::with_capacity(capacity))
+                SubcolumnBuilder::String(Vec::with_capacity(capacity))
             }
-            InferredType::Int64 => SubcolumnBuilderCompact::Int64(Vec::with_capacity(capacity)),
-            InferredType::Uint64 => SubcolumnBuilderCompact::Uint64(Vec::with_capacity(capacity)),
-            InferredType::Float64 => SubcolumnBuilderCompact::Float64(Vec::with_capacity(capacity)),
-            InferredType::Boolean => SubcolumnBuilderCompact::Boolean(Vec::with_capacity(capacity)),
+            InferredType::Int64 => SubcolumnBuilder::Int64(Vec::with_capacity(capacity)),
+            InferredType::Uint64 => SubcolumnBuilder::Uint64(Vec::with_capacity(capacity)),
+            InferredType::Float64 => SubcolumnBuilder::Float64(Vec::with_capacity(capacity)),
+            InferredType::Boolean => SubcolumnBuilder::Boolean(Vec::with_capacity(capacity)),
         }
     }
 
     #[inline]
     fn push(&mut self, value: Option<&CompactValue>) {
         match self {
-            SubcolumnBuilderCompact::String(vec) => {
-                vec.push(value.map(|v| v.to_string()));
+            SubcolumnBuilder::String(vec) => {
+                vec.push(value.map(|v| v.to_string_value()));
             }
-            SubcolumnBuilderCompact::Int64(vec) => {
+            SubcolumnBuilder::Int64(vec) => {
                 vec.push(value.and_then(|v| v.as_i64()));
             }
-            SubcolumnBuilderCompact::Uint64(vec) => {
+            SubcolumnBuilder::Uint64(vec) => {
                 vec.push(value.and_then(|v| v.as_u64()));
             }
-            SubcolumnBuilderCompact::Float64(vec) => {
+            SubcolumnBuilder::Float64(vec) => {
                 vec.push(value.and_then(|v| v.as_f64()));
             }
-            SubcolumnBuilderCompact::Boolean(vec) => {
+            SubcolumnBuilder::Boolean(vec) => {
                 vec.push(value.and_then(|v| v.as_bool()));
             }
         }
@@ -286,11 +276,11 @@ impl SubcolumnBuilderCompact {
 
     fn finish(self) -> SubcolumnData {
         match self {
-            SubcolumnBuilderCompact::String(vec) => SubcolumnData::String(vec),
-            SubcolumnBuilderCompact::Int64(vec) => SubcolumnData::Int64(vec),
-            SubcolumnBuilderCompact::Uint64(vec) => SubcolumnData::Uint64(vec),
-            SubcolumnBuilderCompact::Float64(vec) => SubcolumnData::Float64(vec),
-            SubcolumnBuilderCompact::Boolean(vec) => SubcolumnData::Boolean(vec),
+            SubcolumnBuilder::String(vec) => SubcolumnData::String(vec),
+            SubcolumnBuilder::Int64(vec) => SubcolumnData::Int64(vec),
+            SubcolumnBuilder::Uint64(vec) => SubcolumnData::Uint64(vec),
+            SubcolumnBuilder::Float64(vec) => SubcolumnData::Float64(vec),
+            SubcolumnBuilder::Boolean(vec) => SubcolumnData::Boolean(vec),
         }
     }
 }
@@ -299,6 +289,16 @@ impl SubcolumnBuilderCompact {
 struct KeyStats {
     count: usize,
     inferred_type: InferredType,
+}
+
+/// Result of parsing a single row in Pass 2
+struct RowParseResult {
+    /// Values for subcolumns: (builder_index, value)
+    subcolumn_values: SmallVec<[(usize, CompactValue); 16]>,
+    /// Overflow entries: (bucket_idx, key_idx, value) - using key_idx to avoid String clone
+    overflow_entries: SmallVec<[(usize, usize, CompactValue); 8]>,
+    /// Original JSON if keeping
+    original: Option<String>,
 }
 
 /// Processor for expanding JSON columns
@@ -319,227 +319,354 @@ impl JsonColumnProcessor {
     }
 
     /// Process a batch of JSON string values and return the expanded columns
+    ///
+    /// Optimized two-pass approach:
+    /// - Pass 1: Parallel key scanning to determine schema
+    /// - Pass 2: Parallel parsing with direct output building
     pub fn process_batch<'a, I>(&self, json_values: I) -> ProcessedJsonColumns
     where
         I: Iterator<Item = Option<&'a str>>,
     {
         let json_values: Vec<Option<&str>> = json_values.collect();
         let num_rows = json_values.len();
-
-        // Phase 1: Parse and flatten JSON in parallel using simd-json
         let max_depth = self.config.max_depth;
+        let bucket_count = self.config.bucket_count;
+        let max_subcolumns = self.config.max_subcolumns;
         let keep_original = self.config.keep_original_column;
 
-        let parse_results: Vec<(Option<String>, Vec<(String, CompactValue)>)> = json_values
+        // ============================================================
+        // PASS 1: Parallel key scanning (minimal memory - only keys and types)
+        // Uses BorrowedValue to avoid allocating string copies
+        // ============================================================
+        let key_scan_results: Vec<SmallVec<[(String, InferredType); 32]>> = json_values
             .par_iter()
-            .map(|json_str| match json_str {
-                Some(s) if !s.is_empty() => {
-                    let original = if keep_original {
-                        Some((*s).to_string())
-                    } else {
-                        None
-                    };
-                    let mut s_owned = s.to_string();
-                    // SAFETY: simd_json::from_str requires mutable access
-                    let parse_result =
-                        unsafe { simd_json::from_str::<simd_json::OwnedValue>(&mut s_owned) };
-
-                    match parse_result {
-                        Ok(simd_json::OwnedValue::Object(obj)) => {
-                            let mut flattened = Vec::with_capacity(obj.len() * 2);
-                            let mut key_buffer = String::with_capacity(128);
-                            Self::flatten_simd_to_strings(
-                                *obj,
-                                "",
-                                0,
-                                max_depth,
-                                &mut flattened,
-                                &mut key_buffer,
-                            );
-                            (original, flattened)
+            .map(|json_str| {
+                let mut keys = SmallVec::new();
+                if let Some(s) = json_str {
+                    if !s.is_empty() {
+                        let mut s_owned = s.to_string();
+                        if let Ok(simd_json::BorrowedValue::Object(ref obj)) =
+                            unsafe { simd_json::from_str::<simd_json::BorrowedValue>(&mut s_owned) }
+                        {
+                            let mut key_buffer = String::with_capacity(64);
+                            Self::scan_keys(obj, "", 0, max_depth, &mut keys, &mut key_buffer);
                         }
-                        _ => (original, Vec::new()),
                     }
                 }
-                _ => (None, Vec::new())
+                keys
             })
             .collect();
 
-        // Phase 2: Sequential key interning and statistics gathering
-        let mut key_interner: HashMap<Rc<str>, usize> = HashMap::with_capacity(256);
-        let mut interned_keys: Vec<Rc<str>> = Vec::with_capacity(256);
+        // Aggregate key statistics (sequential - fast with AHashMap)
+        let mut key_to_idx: AHashMap<String, usize> = AHashMap::with_capacity(256);
+        let mut keys: Vec<String> = Vec::with_capacity(256);
         let mut key_stats: Vec<KeyStats> = Vec::with_capacity(256);
-        let mut all_flattened: Vec<Vec<(usize, CompactValue)>> = Vec::with_capacity(num_rows);
-        let mut original_values: Vec<Option<String>> = if self.config.keep_original_column {
+
+        for row_keys in &key_scan_results {
+            for (key, inferred_type) in row_keys {
+                let key_idx = match key_to_idx.get(key) {
+                    Some(&idx) => idx,
+                    None => {
+                        let idx = keys.len();
+                        key_to_idx.insert(key.clone(), idx);
+                        keys.push(key.clone());
+                        key_stats.push(KeyStats {
+                            count: 0,
+                            inferred_type: InferredType::Null,
+                        });
+                        idx
+                    }
+                };
+
+                if *inferred_type != InferredType::Null {
+                    let stats = &mut key_stats[key_idx];
+                    stats.count += 1;
+                    stats.inferred_type = stats.inferred_type.resolve_conflict(*inferred_type);
+                }
+            }
+        }
+
+        // Free scan results memory
+        drop(key_scan_results);
+
+        // Sort keys by frequency, determine subcolumns vs overflow
+        let mut sorted_indices: Vec<usize> = (0..keys.len()).collect();
+        sorted_indices.sort_unstable_by(|&a, &b| {
+            key_stats[b].count.cmp(&key_stats[a].count)
+                .then_with(|| keys[a].cmp(&keys[b]))
+        });
+
+        let subcolumn_indices: AHashSet<usize> = sorted_indices
+            .iter()
+            .take(max_subcolumns)
+            .copied()
+            .collect();
+
+        let overflow_indices: AHashSet<usize> = sorted_indices
+            .iter()
+            .skip(max_subcolumns)
+            .copied()
+            .collect();
+
+        // Precompute bucket indices for overflow keys using MurmurHash3
+        let mut key_to_bucket: Vec<usize> = vec![0; keys.len()];
+        for &idx in &overflow_indices {
+            key_to_bucket[idx] = Self::hash_key_to_bucket(&keys[idx], bucket_count);
+        }
+
+        // Create mapping from key index to builder index
+        let mut key_to_builder: Vec<Option<usize>> = vec![None; keys.len()];
+        let subcolumn_keys: Vec<usize> = sorted_indices.iter().take(max_subcolumns).copied().collect();
+        for (builder_idx, &key_idx) in subcolumn_keys.iter().enumerate() {
+            key_to_builder[key_idx] = Some(builder_idx);
+        }
+
+        // ============================================================
+        // PASS 2: Chunked parallel parsing with incremental output building
+        // Processes rows in chunks to limit peak memory usage
+        // ============================================================
+        let num_builders = subcolumn_keys.len();
+
+        // Initialize builders
+        let mut subcolumn_builders: Vec<SubcolumnBuilder> = subcolumn_keys
+            .iter()
+            .map(|&key_idx| {
+                let final_type = self.get_type_for_key(&keys[key_idx], key_stats[key_idx].inferred_type);
+                SubcolumnBuilder::new(final_type, num_rows)
+            })
+            .collect();
+
+        // Initialize bucket maps
+        let mut bucket_maps: Vec<AHashMap<usize, AHashMap<String, String>>> =
+            (0..bucket_count).map(|_| AHashMap::new()).collect();
+
+        // Original values
+        let mut original_values: Vec<Option<String>> = if keep_original {
             Vec::with_capacity(num_rows)
         } else {
             Vec::new()
         };
 
-        for (original, flattened_strings) in parse_results {
-            if self.config.keep_original_column {
-                original_values.push(original);
-            }
-
-            let mut flattened: Vec<(usize, CompactValue)> =
-                Vec::with_capacity(flattened_strings.len());
-            for (key, value) in flattened_strings {
-                let key_rc: Rc<str> = key.into();
-                let key_idx = if let Some(&idx) = key_interner.get(&key_rc) {
-                    idx
-                } else {
-                    let idx = interned_keys.len();
-                    key_interner.insert(key_rc.clone(), idx);
-                    interned_keys.push(key_rc);
-                    key_stats.push(KeyStats {
-                        count: 0,
-                        inferred_type: InferredType::Null,
-                    });
-                    idx
-                };
-
-                if !value.is_null_or_empty() {
-                    let stats = &mut key_stats[key_idx];
-                    stats.count += 1;
-                    stats.inferred_type = stats.inferred_type.resolve_conflict(value.infer_type());
-                }
-
-                flattened.push((key_idx, value));
-            }
-            all_flattened.push(flattened);
-        }
-
-        // Phase 3: Sort keys by frequency and determine subcolumns vs overflow
-        let mut sorted_key_indices: Vec<usize> = (0..interned_keys.len()).collect();
-        sorted_key_indices.sort_unstable_by(|&a, &b| {
-            key_stats[b]
-                .count
-                .cmp(&key_stats[a].count)
-                .then(interned_keys[a].cmp(&interned_keys[b]))
-        });
-
-        let overflow_key_indices: std::collections::HashSet<usize> = sorted_key_indices
-            .iter()
-            .skip(self.config.max_subcolumns)
-            .copied()
-            .collect();
-
-        // Phase 4: Build subcolumns and bucket maps
-        let mut subcolumn_builders: Vec<(usize, SubcolumnBuilderCompact)> = sorted_key_indices
-            .iter()
-            .take(self.config.max_subcolumns)
-            .map(|&idx| {
-                let key = &interned_keys[idx];
-                let final_type = self.get_type_for_key(key, key_stats[idx].inferred_type);
-                (idx, SubcolumnBuilderCompact::new(final_type, num_rows))
-            })
-            .collect();
-
-        // Use sparse storage for bucket maps - only allocate for rows that have overflow data
-        let mut bucket_maps: Vec<HashMap<usize, HashMap<String, String>>> =
-            vec![HashMap::new(); self.config.bucket_count];
-
-        let num_keys = interned_keys.len();
-        let mut key_to_builder: Vec<Option<usize>> = vec![None; num_keys];
-        for (builder_idx, (key_idx, _)) in subcolumn_builders.iter().enumerate() {
-            key_to_builder[*key_idx] = Some(builder_idx);
-        }
-
-        let num_builders = subcolumn_builders.len();
-        let mut row_values: Vec<Option<&CompactValue>> = vec![None; num_builders];
+        // Temporary storage for row processing
+        let mut row_values: Vec<Option<CompactValue>> = vec![None; num_builders];
         let mut row_has_good_value: Vec<bool> = vec![false; num_builders];
 
-        for (row_idx, flattened) in all_flattened.iter().enumerate() {
-            row_values.iter_mut().for_each(|x| *x = None);
-            row_has_good_value.iter_mut().for_each(|x| *x = false);
+        // Process in chunks to limit peak memory (chunk size trades off memory vs parallelism overhead)
+        const CHUNK_SIZE: usize = 500;
+        let mut global_row_idx = 0usize;
 
-            for (key_idx, value) in flattened {
-                if let Some(builder_idx) = key_to_builder.get(*key_idx).copied().flatten() {
-                    // First non-null, non-empty value wins for subcolumns
-                    let is_good_value = !value.is_null_or_empty();
-                    if row_values[builder_idx].is_none()
-                        || (!row_has_good_value[builder_idx] && is_good_value)
-                    {
-                        row_values[builder_idx] = Some(value);
-                        row_has_good_value[builder_idx] = is_good_value;
+        for chunk in json_values.chunks(CHUNK_SIZE) {
+            // Parse chunk in parallel using BorrowedValue
+            let chunk_results: Vec<RowParseResult> = chunk
+                .par_iter()
+                .map(|json_str| {
+                    let mut result = RowParseResult {
+                        subcolumn_values: SmallVec::new(),
+                        overflow_entries: SmallVec::new(),
+                        original: None,
+                    };
+
+                    match json_str {
+                        Some(s) if !s.is_empty() => {
+                            if keep_original {
+                                result.original = Some((*s).to_string());
+                            }
+
+                            let mut s_owned = s.to_string();
+                            if let Ok(simd_json::BorrowedValue::Object(ref obj)) =
+                                unsafe { simd_json::from_str::<simd_json::BorrowedValue>(&mut s_owned) }
+                            {
+                                let mut key_buffer = String::with_capacity(64);
+                                Self::extract_values(
+                                    obj,
+                                    "",
+                                    0,
+                                    max_depth,
+                                    &mut key_buffer,
+                                    &key_to_idx,
+                                    &key_to_builder,
+                                    &subcolumn_indices,
+                                    &overflow_indices,
+                                    &keys,
+                                    &key_to_bucket,
+                                    &mut result,
+                                );
+                            }
+                        }
+                        _ => {}
                     }
-                } else if overflow_key_indices.contains(key_idx) && !value.is_null_or_empty() {
-                    let key = &interned_keys[*key_idx];
-                    let bucket_idx = self.hash_key_to_bucket(key);
-                    let value_str = value.to_string();
-                    bucket_maps[bucket_idx]
-                        .entry(row_idx)
-                        .or_insert_with(HashMap::new)
-                        .insert(key.to_string(), value_str);
-                }
-            }
 
-            for builder_idx in 0..num_builders {
-                subcolumn_builders[builder_idx].1.push(row_values[builder_idx]);
+                    result
+                })
+                .collect();
+
+            // Process chunk results sequentially and immediately free memory
+            for parse_result in chunk_results {
+                // Store original
+                if keep_original {
+                    original_values.push(parse_result.original);
+                }
+
+                // Reset row state
+                row_values.iter_mut().for_each(|x| *x = None);
+                row_has_good_value.iter_mut().for_each(|x| *x = false);
+
+                // Collect subcolumn values (first non-null wins)
+                for (builder_idx, value) in parse_result.subcolumn_values {
+                    let is_good = !value.is_null_or_empty();
+                    if row_values[builder_idx].is_none() || (!row_has_good_value[builder_idx] && is_good) {
+                        row_values[builder_idx] = Some(value);
+                        row_has_good_value[builder_idx] = is_good;
+                    }
+                }
+
+                // Push to builders
+                for (builder_idx, builder) in subcolumn_builders.iter_mut().enumerate() {
+                    builder.push(row_values[builder_idx].as_ref());
+                }
+
+                // Handle overflow entries - look up key by index
+                for (bucket_idx, key_idx, value) in parse_result.overflow_entries {
+                    bucket_maps[bucket_idx]
+                        .entry(global_row_idx)
+                        .or_default()
+                        .insert(keys[key_idx].clone(), value.to_string_value());
+                }
+
+                global_row_idx += 1;
             }
+            // chunk_results is dropped here, freeing memory before processing next chunk
         }
 
+        // Finalize subcolumns
         let mut subcolumns: BTreeMap<String, SubcolumnData> = BTreeMap::new();
-        for (key_idx, builder) in subcolumn_builders {
-            let key = &interned_keys[key_idx];
-            let full_key = format!("{}.{}", self.config.column, key);
+        for (builder_idx, builder) in subcolumn_builders.into_iter().enumerate() {
+            let key_idx = subcolumn_keys[builder_idx];
+            let full_key = format!("{}.{}", self.config.column, keys[key_idx]);
             subcolumns.insert(full_key, builder.finish());
         }
 
-        drop(all_flattened);
-
-        // bucket_maps is already in sparse format - no conversion needed
-
         ProcessedJsonColumns {
             column_name: self.config.column.clone(),
-            original_values: if self.config.keep_original_column {
-                Some(original_values)
-            } else {
-                None
-            },
+            original_values: if keep_original { Some(original_values) } else { None },
             subcolumns,
             bucket_maps,
-            bucket_count: self.config.bucket_count,
+            bucket_count,
             num_rows,
         }
     }
 
-    /// Flatten a simd_json object into String keys and CompactValues
-    fn flatten_simd_to_strings(
-        obj: simd_json::owned::Object,
+    /// Scan keys from a simd_json borrowed object (Pass 1)
+    fn scan_keys<'a>(
+        obj: &'a simd_json::borrowed::Object<'a>,
         prefix: &str,
         depth: usize,
         max_depth: usize,
-        result: &mut Vec<(String, CompactValue)>,
+        result: &mut SmallVec<[(String, InferredType); 32]>,
         key_buffer: &mut String,
     ) {
-        use simd_json::OwnedValue;
+        use simd_json::BorrowedValue;
 
-        for (key, value) in obj {
+        for (key, value) in obj.iter() {
             key_buffer.clear();
             if !prefix.is_empty() {
                 key_buffer.push_str(prefix);
                 key_buffer.push('.');
             }
-            key_buffer.push_str(&key);
+            key_buffer.push_str(key);
 
             match value {
-                OwnedValue::Object(nested) if depth < max_depth => {
+                BorrowedValue::Object(nested) if depth < max_depth => {
                     let current_prefix = key_buffer.clone();
-                    Self::flatten_simd_to_strings(
-                        *nested,
-                        &current_prefix,
-                        depth + 1,
-                        max_depth,
-                        result,
-                        key_buffer,
-                    );
+                    Self::scan_keys(nested, &current_prefix, depth + 1, max_depth, result, key_buffer);
                 }
                 _ => {
-                    result.push((key_buffer.clone(), CompactValue::from_simd_owned(value)));
+                    let inferred_type = Self::infer_type_borrowed(value);
+                    result.push((key_buffer.clone(), inferred_type));
                 }
             }
         }
+    }
+
+    /// Infer type from simd_json borrowed value
+    #[inline]
+    fn infer_type_borrowed(value: &simd_json::BorrowedValue<'_>) -> InferredType {
+        use simd_json::BorrowedValue;
+        match value {
+            BorrowedValue::Static(simd_json::StaticNode::Null) => InferredType::Null,
+            BorrowedValue::Static(simd_json::StaticNode::Bool(_)) => InferredType::Boolean,
+            BorrowedValue::Static(simd_json::StaticNode::I64(_)) => InferredType::Int64,
+            BorrowedValue::Static(simd_json::StaticNode::U64(u)) => {
+                if *u > i64::MAX as u64 { InferredType::String } else { InferredType::Uint64 }
+            }
+            BorrowedValue::Static(simd_json::StaticNode::F64(_)) => InferredType::Float64,
+            BorrowedValue::String(s) if s.is_empty() => InferredType::Null,
+            BorrowedValue::String(_) => InferredType::String,
+            BorrowedValue::Array(_) | BorrowedValue::Object(_) => InferredType::String,
+        }
+    }
+
+    /// Extract values from a borrowed JSON object (Pass 2)
+    #[allow(clippy::too_many_arguments)]
+    fn extract_values<'a>(
+        obj: &'a simd_json::borrowed::Object<'a>,
+        prefix: &str,
+        depth: usize,
+        max_depth: usize,
+        key_buffer: &mut String,
+        key_to_idx: &AHashMap<String, usize>,
+        key_to_builder: &[Option<usize>],
+        subcolumn_indices: &AHashSet<usize>,
+        overflow_indices: &AHashSet<usize>,
+        keys: &[String],
+        key_to_bucket: &[usize],
+        result: &mut RowParseResult,
+    ) {
+        use simd_json::BorrowedValue;
+
+        for (key, value) in obj.iter() {
+            key_buffer.clear();
+            if !prefix.is_empty() {
+                key_buffer.push_str(prefix);
+                key_buffer.push('.');
+            }
+            key_buffer.push_str(key);
+
+            match value {
+                BorrowedValue::Object(nested) if depth < max_depth => {
+                    let current_prefix = key_buffer.clone();
+                    Self::extract_values(
+                        nested, &current_prefix, depth + 1, max_depth, key_buffer,
+                        key_to_idx, key_to_builder, subcolumn_indices, overflow_indices,
+                        keys, key_to_bucket, result,
+                    );
+                }
+                _ => {
+                    if let Some(&key_idx) = key_to_idx.get(key_buffer.as_str()) {
+                        let compact_value = CompactValue::from_simd_borrowed(value);
+
+                        if subcolumn_indices.contains(&key_idx) {
+                            if let Some(builder_idx) = key_to_builder[key_idx] {
+                                result.subcolumn_values.push((builder_idx, compact_value));
+                            }
+                        } else if overflow_indices.contains(&key_idx) && !compact_value.is_null_or_empty() {
+                            let bucket_idx = key_to_bucket[key_idx];
+                            // Store key_idx instead of cloning the key string
+                            result.overflow_entries.push((bucket_idx, key_idx, compact_value));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hash a key to a bucket index using MurmurHash3 128-bit
+    #[inline]
+    fn hash_key_to_bucket(key: &str, bucket_count: usize) -> usize {
+        use std::io::Cursor;
+        let hash = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), 0)
+            .expect("murmur3 hash should not fail");
+        (hash as usize) % bucket_count
     }
 
     /// Get the final type for a key, checking type hints first
@@ -556,14 +683,6 @@ impl JsonColumnProcessor {
             }
         }
         inferred_type
-    }
-
-    /// Hash a key to a bucket index using MurmurHash3 128-bit
-    fn hash_key_to_bucket(&self, key: &str) -> usize {
-        use std::io::Cursor;
-        let hash = murmur3::murmur3_x64_128(&mut Cursor::new(key.as_bytes()), 0)
-            .expect("murmur3 hash should not fail on in-memory data");
-        (hash as usize) % self.config.bucket_count
     }
 }
 
@@ -583,12 +702,10 @@ impl ProcessedJsonColumns {
                 let name = format!("{}__json_type_bucket_{}", self.column_name, bucket_idx);
                 let bucket_data = &self.bucket_maps[bucket_idx];
 
-                // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
                 let key_builder = LargeStringBuilder::new();
                 let value_builder = LargeStringBuilder::new();
                 let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
 
-                // Iterate through all rows, looking up sparse data
                 for row_idx in 0..self.num_rows {
                     if let Some(row_map) = bucket_data.get(&row_idx) {
                         let mut sorted_entries: Vec<_> = row_map.iter().collect();
@@ -599,11 +716,10 @@ impl ProcessedJsonColumns {
                             map_builder.values().append_value(v);
                         }
                     }
-                    // Append the map entry (empty if no data for this row)
-                    map_builder.append(true).unwrap();
+                    map_builder.append(true).expect("map append should not fail");
                 }
 
-                let array: ArrayRef = std::sync::Arc::new(map_builder.finish());
+                let array: ArrayRef = Arc::new(map_builder.finish());
                 (name, array)
             })
             .collect()
@@ -612,7 +728,6 @@ impl ProcessedJsonColumns {
     /// Convert original values to Arrow array
     pub fn original_to_array(&self) -> Option<(String, ArrayRef)> {
         self.original_values.as_ref().map(|values| {
-            // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
             let mut builder = LargeStringBuilder::with_capacity(values.len(), values.len() * 100);
             for value in values {
                 match value {
@@ -620,7 +735,7 @@ impl ProcessedJsonColumns {
                     None => builder.append_null(),
                 }
             }
-            let array: ArrayRef = std::sync::Arc::new(builder.finish());
+            let array: ArrayRef = Arc::new(builder.finish());
             (self.column_name.clone(), array)
         })
     }
@@ -683,40 +798,27 @@ mod tests {
         let config = create_test_config();
         let processor = JsonColumnProcessor::new(config);
 
-        let json_values =
-            vec![Some(r#"{"count": 10, "rate": 3.14, "active": true, "name": "test"}"#)];
+        let json_values = vec![Some(r#"{"count": 10, "rate": 3.14, "active": true, "name": "test"}"#)];
 
         let result = processor.process_batch(json_values.into_iter());
 
         assert!(
-            matches!(
-                result.subcolumns.get("properties.count"),
-                Some(SubcolumnData::Uint64(_)) | Some(SubcolumnData::Int64(_))
-            ),
+            matches!(result.subcolumns.get("properties.count"), Some(SubcolumnData::Uint64(_)) | Some(SubcolumnData::Int64(_))),
             "count should be numeric"
         );
 
         assert!(
-            matches!(
-                result.subcolumns.get("properties.rate"),
-                Some(SubcolumnData::Float64(_))
-            ),
+            matches!(result.subcolumns.get("properties.rate"), Some(SubcolumnData::Float64(_))),
             "rate should be float"
         );
 
         assert!(
-            matches!(
-                result.subcolumns.get("properties.active"),
-                Some(SubcolumnData::Boolean(_))
-            ),
+            matches!(result.subcolumns.get("properties.active"), Some(SubcolumnData::Boolean(_))),
             "active should be boolean"
         );
 
         assert!(
-            matches!(
-                result.subcolumns.get("properties.name"),
-                Some(SubcolumnData::String(_))
-            ),
+            matches!(result.subcolumns.get("properties.name"), Some(SubcolumnData::String(_))),
             "name should be string"
         );
     }
@@ -746,11 +848,8 @@ mod tests {
 
     #[test]
     fn test_hash_distribution() {
-        let config = create_test_config();
-        let processor = JsonColumnProcessor::new(config);
-
         let buckets: Vec<usize> = (0..100)
-            .map(|i| processor.hash_key_to_bucket(&format!("key_{}", i)))
+            .map(|i| JsonColumnProcessor::hash_key_to_bucket(&format!("key_{}", i), 4))
             .collect();
 
         let mut bucket_used = [false; 4];
@@ -775,11 +874,7 @@ mod tests {
         if let Some(SubcolumnData::String(values)) = result.subcolumns.get("properties.user.name") {
             assert_eq!(values.len(), 2, "Should have exactly 2 rows");
             assert!(values[0].is_some(), "First row should have a value");
-            assert_eq!(
-                values[1],
-                Some("only_nested".to_string()),
-                "Second row should be 'only_nested'"
-            );
+            assert_eq!(values[1], Some("only_nested".to_string()), "Second row should be 'only_nested'");
         } else {
             panic!("Expected string subcolumn for user.name");
         }
@@ -799,16 +894,8 @@ mod tests {
 
         if let Some(SubcolumnData::String(values)) = result.subcolumns.get("properties.val.key") {
             assert_eq!(values.len(), 2, "Should have exactly 2 rows");
-            assert_eq!(
-                values[0],
-                Some("good_value".to_string()),
-                "First row: non-null should win over null"
-            );
-            assert_eq!(
-                values[1],
-                Some("also_good".to_string()),
-                "Second row: non-empty should win over empty"
-            );
+            assert_eq!(values[0], Some("good_value".to_string()), "First row: non-null should win");
+            assert_eq!(values[1], Some("also_good".to_string()), "Second row: non-empty should win");
         } else {
             panic!("Expected string subcolumn for val.key");
         }
@@ -865,26 +952,17 @@ mod tests {
         let result = processor.process_batch(json_values.into_iter());
 
         assert!(
-            matches!(
-                result.subcolumns.get("properties.count"),
-                Some(SubcolumnData::String(_))
-            ),
+            matches!(result.subcolumns.get("properties.count"), Some(SubcolumnData::String(_))),
             "count should be String due to type hint"
         );
 
         assert!(
-            matches!(
-                result.subcolumns.get("properties.id"),
-                Some(SubcolumnData::Int64(_))
-            ),
+            matches!(result.subcolumns.get("properties.id"), Some(SubcolumnData::Int64(_))),
             "id should be Int64 due to type hint"
         );
 
         assert!(
-            matches!(
-                result.subcolumns.get("properties.name"),
-                Some(SubcolumnData::String(_))
-            ),
+            matches!(result.subcolumns.get("properties.name"), Some(SubcolumnData::String(_))),
             "name should be String (inferred)"
         );
 

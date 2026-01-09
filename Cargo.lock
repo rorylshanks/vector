@@ -2593,6 +2593,7 @@ dependencies = [
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.11",
  "apache-avro 0.20.0",
  "arrow",
  "async-trait",
