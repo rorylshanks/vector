@@ -3,7 +3,10 @@ use std::io;
 use bytes::Bytes;
 use chrono::{FixedOffset, Utc};
 use uuid::Uuid;
-use vector_lib::{event::Finalizable, request_metadata::RequestMetadata};
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf, config::telemetry, event::Finalizable,
+    request_metadata::RequestMetadata,
+};
 
 use crate::{
     codecs::{EncoderKind, Transformer},
@@ -15,8 +18,8 @@ use crate::{
             service::{S3Metadata, S3Request},
         },
         util::{
-            Compression, RequestBuilder, metadata::RequestMetadataBuilder,
-            request_builder::EncodeResult,
+            Compression, IncrementalRequestBuilder, RequestBuilder,
+            metadata::RequestMetadataBuilder, request_builder::EncodeResult,
         },
     },
 };
@@ -119,6 +122,155 @@ fn format_s3_key(s3_key: &str, filename: &str, extension: &str) -> String {
         format!("{s3_key}{filename}")
     } else {
         format!("{s3_key}{filename}.{extension}")
+    }
+}
+
+/// Request builder for super-batch mode (parquet with rows_per_file).
+///
+/// This builder implements `IncrementalRequestBuilder` to support splitting
+/// a single batch of events into multiple S3 requests, one per parquet file.
+#[cfg(feature = "codecs-parquet")]
+#[derive(Clone)]
+pub struct S3SuperBatchRequestBuilder {
+    pub bucket: String,
+    pub filename_time_format: String,
+    pub filename_append_uuid: bool,
+    pub filename_extension: Option<String>,
+    pub api_options: S3Options,
+    pub encoder: (Transformer, EncoderKind),
+    pub compression: Compression,
+    pub filename_tz_offset: Option<FixedOffset>,
+}
+
+#[cfg(feature = "codecs-parquet")]
+impl S3SuperBatchRequestBuilder {
+    /// Creates a new super-batch request builder from S3RequestOptions.
+    pub fn from_options(options: S3RequestOptions) -> Self {
+        Self {
+            bucket: options.bucket,
+            filename_time_format: options.filename_time_format,
+            filename_append_uuid: options.filename_append_uuid,
+            filename_extension: options.filename_extension,
+            api_options: options.api_options,
+            encoder: options.encoder,
+            compression: options.compression,
+            filename_tz_offset: options.filename_tz_offset,
+        }
+    }
+
+    fn generate_filename(&self) -> String {
+        let formatted_ts = match self.filename_tz_offset {
+            Some(offset) => Utc::now()
+                .with_timezone(&offset)
+                .format(self.filename_time_format.as_str()),
+            None => Utc::now()
+                .with_timezone(&Utc)
+                .format(self.filename_time_format.as_str()),
+        };
+
+        if self.filename_append_uuid {
+            format!("{formatted_ts}-{}", Uuid::new_v4().hyphenated())
+        } else {
+            formatted_ts.to_string()
+        }
+    }
+}
+
+#[cfg(feature = "codecs-parquet")]
+impl IncrementalRequestBuilder<(S3PartitionKey, Vec<Event>)> for S3SuperBatchRequestBuilder {
+    type Metadata = S3Metadata;
+    type Payload = Bytes;
+    type Request = S3Request;
+    type Error = io::Error;
+
+    fn encode_events_incremental(
+        &mut self,
+        input: (S3PartitionKey, Vec<Event>),
+    ) -> Vec<Result<(Self::Metadata, Self::Payload), Self::Error>> {
+        let (partition_key, mut events) = input;
+
+        // Transform events
+        let mut transformed_events = Vec::with_capacity(events.len());
+        let mut byte_size = telemetry().create_request_count_byte_size();
+
+        for mut event in events.drain(..) {
+            self.encoder.0.transform(&mut event);
+            byte_size.add_event(&event, event.estimated_json_encoded_size_of());
+            transformed_events.push(event);
+        }
+
+        // Get finalizers from the transformed events
+        let finalizers = transformed_events.take_finalizers();
+
+        // Encode using super-batch mode (produces multiple parquet files)
+        let parquet_files = match self.encoder.1.encode_batch_split(transformed_events) {
+            Ok(files) => files,
+            Err(err) => {
+                return vec![Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to encode parquet batch: {}", err),
+                ))];
+            }
+        };
+
+        let num_files = parquet_files.len();
+        let s3_key_prefix = partition_key.key_prefix.clone();
+
+        // Create a request for each parquet file
+        parquet_files
+            .into_iter()
+            .enumerate()
+            .map(|(idx, file_bytes)| {
+                // Split finalizers - only the last file gets the finalizers
+                let file_finalizers = if idx == num_files - 1 {
+                    finalizers.clone()
+                } else {
+                    Default::default()
+                };
+
+                let metadata = S3Metadata {
+                    partition_key: partition_key.clone(),
+                    s3_key: s3_key_prefix.clone(),
+                    finalizers: file_finalizers,
+                };
+
+                Ok((metadata, file_bytes))
+            })
+            .collect()
+    }
+
+    fn build_request(&mut self, mut metadata: Self::Metadata, payload: Self::Payload) -> Self::Request {
+        let filename = self.generate_filename();
+
+        let ssekms_key_id = metadata.partition_key.ssekms_key_id.clone();
+        let mut s3_options = self.api_options.clone();
+        s3_options.ssekms_key_id = ssekms_key_id;
+
+        let extension = self
+            .filename_extension
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.compression.extension().into());
+
+        metadata.s3_key = format_s3_key(&metadata.s3_key, &filename, &extension);
+
+        let uncompressed_size = payload.len();
+        let request_metadata_builder = RequestMetadataBuilder::new(
+            0, // We don't track event count per file in super-batch mode
+            uncompressed_size,
+            telemetry().create_request_count_byte_size(),
+        );
+        let encode_result = EncodeResult::uncompressed(payload, telemetry().create_request_count_byte_size());
+        let request_metadata = request_metadata_builder.build(&encode_result);
+
+        S3Request {
+            body: encode_result.into_payload(),
+            bucket: self.bucket.clone(),
+            metadata,
+            request_metadata,
+            content_encoding: self.compression.content_encoding(),
+            options: s3_options,
+        }
     }
 }
 
