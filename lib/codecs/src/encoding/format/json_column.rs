@@ -9,8 +9,8 @@ use std::rc::Rc;
 use rayon::prelude::*;
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, MapBuilder, StringBuilder,
-    UInt64Builder,
+    ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, LargeStringBuilder, MapBuilder,
+    StringBuilder, UInt64Builder,
 };
 
 use super::parquet::{JsonColumnConfig, JsonTypeHint};
@@ -584,8 +584,9 @@ impl ProcessedJsonColumns {
                 let name = format!("{}__json_type_bucket_{}", self.column_name, bucket_idx);
                 let bucket_data = &self.bucket_maps[bucket_idx];
 
-                let key_builder = StringBuilder::new();
-                let value_builder = StringBuilder::new();
+                // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
+                let key_builder = LargeStringBuilder::new();
+                let value_builder = LargeStringBuilder::new();
                 let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
 
                 for row_map in bucket_data {
