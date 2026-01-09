@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use aws_sdk_s3::Client as S3Client;
 use tower::ServiceBuilder;
 use vector_lib::{
@@ -262,8 +264,23 @@ impl S3SinkConfig {
         // Check if super-batch mode is enabled (parquet with rows_per_file)
         #[cfg(feature = "codecs-parquet")]
         if request_options.encoder.1.is_super_batch_enabled() {
+            // Use configured concurrency, defaulting to 8 for adaptive mode
+            let concurrency_limit = self
+                .request
+                .concurrency
+                .parse_concurrency()
+                .unwrap_or(8);
+            let concurrency_limit = NonZeroUsize::new(concurrency_limit.max(1))
+                .expect("concurrency limit must be non-zero");
+
             let super_batch_builder = S3SuperBatchRequestBuilder::from_options(request_options);
-            let sink = S3SuperBatchSink::new(service, super_batch_builder, partitioner, batch_settings);
+            let sink = S3SuperBatchSink::new(
+                service,
+                super_batch_builder,
+                partitioner,
+                batch_settings,
+                concurrency_limit,
+            );
             return Ok(VectorSink::from_event_streamsink(sink));
         }
 

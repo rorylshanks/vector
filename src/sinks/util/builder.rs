@@ -193,6 +193,46 @@ pub trait SinkBuilderExt: Stream {
         }))
     }
 
+    /// Constructs a [`Stream`] which transforms the input into requests concurrently.
+    ///
+    /// This is a concurrent version of `incremental_request_builder`. Each input batch is
+    /// processed in parallel up to the given limit. The builder must implement `Clone` so
+    /// each concurrent task can have its own copy.
+    ///
+    /// Each input is transformed concurrently, up to the given limit. A limit of `n` limits
+    /// this stage to `n` concurrent operations at any given time.
+    fn concurrent_incremental_request_builder<B>(
+        self,
+        limit: NonZeroUsize,
+        builder: B,
+    ) -> ConcurrentMap<Self, Vec<Result<B::Request, B::Error>>>
+    where
+        Self: Sized,
+        Self::Item: Send + 'static,
+        B: IncrementalRequestBuilder<<Self as Stream>::Item> + Clone + Send + Sync + 'static,
+        B::Error: Send,
+        B::Request: Send,
+    {
+        let span = Arc::new(Span::current());
+
+        self.concurrent_map(limit, move |input| {
+            let mut builder = builder.clone();
+            let span = Arc::clone(&span);
+
+            Box::pin(async move {
+                let _entered = span.enter();
+
+                builder
+                    .encode_events_incremental(input)
+                    .into_iter()
+                    .map(|result| {
+                        result.map(|(metadata, payload)| builder.build_request(metadata, payload))
+                    })
+                    .collect()
+            })
+        })
+    }
+
     /// Normalizes a stream of [`Metric`] events with the provided normalizer.
     ///
     /// An implementation of [`MetricNormalize`] is used to either drop metrics which cannot be

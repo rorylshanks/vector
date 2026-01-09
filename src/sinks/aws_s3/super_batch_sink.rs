@@ -3,7 +3,7 @@
 //! This sink uses IncrementalRequestBuilder to split a batch of events into
 //! multiple parquet files based on the rows_per_file configuration.
 
-use std::{fmt, hash::Hash};
+use std::{fmt, hash::Hash, num::NonZeroUsize};
 
 use futures::{StreamExt, stream::BoxStream};
 use tower::Service;
@@ -22,20 +22,23 @@ pub struct S3SuperBatchSink<Svc, P> {
     request_builder: S3SuperBatchRequestBuilder,
     partitioner: P,
     batcher_settings: BatcherSettings,
+    concurrency_limit: NonZeroUsize,
 }
 
 impl<Svc, P> S3SuperBatchSink<Svc, P> {
-    pub const fn new(
+    pub fn new(
         service: Svc,
         request_builder: S3SuperBatchRequestBuilder,
         partitioner: P,
         batcher_settings: BatcherSettings,
+        concurrency_limit: NonZeroUsize,
     ) -> Self {
         Self {
             partitioner,
             service,
             request_builder,
             batcher_settings,
+            concurrency_limit,
         }
     }
 }
@@ -54,11 +57,12 @@ where
         let partitioner = self.partitioner;
         let settings = self.batcher_settings;
         let request_builder = self.request_builder;
+        let concurrency_limit = self.concurrency_limit;
 
         input
             .batched_partitioned(partitioner, || settings.as_byte_size_config())
             .filter_map(|(key, batch)| async move { key.map(move |k| (k, batch)) })
-            .incremental_request_builder(request_builder)
+            .concurrent_incremental_request_builder(concurrency_limit, request_builder)
             .flat_map(futures::stream::iter)
             .filter_map(|request| async move {
                 match request {
