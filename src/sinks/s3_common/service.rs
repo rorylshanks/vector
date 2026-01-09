@@ -48,6 +48,10 @@ pub struct S3Metadata {
     pub partition_key: S3PartitionKey,
     pub s3_key: String,
     pub finalizers: EventFinalizers,
+    /// Event count for this request (used by super-batch mode for metrics)
+    pub event_count: Option<usize>,
+    /// Byte size for events in this request (used by super-batch mode for metrics)
+    pub events_byte_size: Option<GroupedCountByteSize>,
 }
 
 #[derive(Debug)]

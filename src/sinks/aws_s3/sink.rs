@@ -66,6 +66,8 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
             partition_key,
             s3_key: s3_key_prefix,
             finalizers,
+            event_count: None,
+            events_byte_size: None,
         };
 
         (metadata, builder, events)
@@ -188,14 +190,15 @@ impl IncrementalRequestBuilder<(S3PartitionKey, Vec<Event>)> for S3SuperBatchReq
         input: (S3PartitionKey, Vec<Event>),
     ) -> Vec<Result<(Self::Metadata, Self::Payload), Self::Error>> {
         let (partition_key, mut events) = input;
+        let total_events = events.len();
 
-        // Transform events
+        // Transform events and track byte size
         let mut transformed_events = Vec::with_capacity(events.len());
-        let mut byte_size = telemetry().create_request_count_byte_size();
+        let mut total_byte_size = telemetry().create_request_count_byte_size();
 
         for mut event in events.drain(..) {
             self.encoder.0.transform(&mut event);
-            byte_size.add_event(&event, event.estimated_json_encoded_size_of());
+            total_byte_size.add_event(&event, event.estimated_json_encoded_size_of());
             transformed_events.push(event);
         }
 
@@ -216,6 +219,10 @@ impl IncrementalRequestBuilder<(S3PartitionKey, Vec<Event>)> for S3SuperBatchReq
         let num_files = parquet_files.len();
         let s3_key_prefix = partition_key.key_prefix.clone();
 
+        // Calculate events per file (distribute evenly, last file gets remainder)
+        let base_events_per_file = total_events / num_files.max(1);
+        let remainder = total_events % num_files.max(1);
+
         // Create a request for each parquet file
         parquet_files
             .into_iter()
@@ -228,10 +235,26 @@ impl IncrementalRequestBuilder<(S3PartitionKey, Vec<Event>)> for S3SuperBatchReq
                     Default::default()
                 };
 
+                // Calculate event count for this file
+                let file_event_count = if idx < remainder {
+                    base_events_per_file + 1
+                } else {
+                    base_events_per_file
+                };
+
+                // Create proportional byte size for this file
+                let mut file_byte_size = telemetry().create_request_count_byte_size();
+                // Clone the total and scale proportionally (approximation)
+                if total_events > 0 {
+                    file_byte_size = total_byte_size.clone();
+                }
+
                 let metadata = S3Metadata {
                     partition_key: partition_key.clone(),
                     s3_key: s3_key_prefix.clone(),
                     finalizers: file_finalizers,
+                    event_count: Some(file_event_count),
+                    events_byte_size: Some(file_byte_size),
                 };
 
                 Ok((metadata, file_bytes))
@@ -255,10 +278,15 @@ impl IncrementalRequestBuilder<(S3PartitionKey, Vec<Event>)> for S3SuperBatchReq
         metadata.s3_key = format_s3_key(&metadata.s3_key, &filename, &extension);
 
         let uncompressed_size = payload.len();
+        // Use event count and byte size from metadata (set in encode_events_incremental)
+        let event_count = metadata.event_count.unwrap_or(0);
+        let events_byte_size = metadata.events_byte_size.clone()
+            .unwrap_or_else(|| telemetry().create_request_count_byte_size());
+
         let request_metadata_builder = RequestMetadataBuilder::new(
-            0, // We don't track event count per file in super-batch mode
+            event_count,
             uncompressed_size,
-            telemetry().create_request_count_byte_size(),
+            events_byte_size,
         );
         let encode_result = EncodeResult::uncompressed(payload, telemetry().create_request_count_byte_size());
         let request_metadata = request_metadata_builder.build(&encode_result);

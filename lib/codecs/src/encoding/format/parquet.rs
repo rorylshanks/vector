@@ -887,56 +887,60 @@ impl ParquetSerializer {
 
         // Calculate number of files needed
         let num_files = (num_rows + rows_per_file - 1) / rows_per_file;
-        let mut parquet_files = Vec::with_capacity(num_files);
 
-        // Process each chunk
-        for chunk_idx in 0..num_files {
-            let start = chunk_idx * rows_per_file;
-            let end = std::cmp::min(start + rows_per_file, num_rows);
-            let chunk_len = end - start;
+        // Process chunks in parallel using rayon
+        // Each chunk is independent: extract rows, expand JSON, encode to Parquet
+        use rayon::prelude::*;
 
-            // Extract the chunk using sorted indices if available
-            let chunk_batch = if let Some(ref indices) = sorted_indices {
-                // Slice the indices for this chunk
-                let chunk_indices = indices.slice(start, chunk_len);
+        let parquet_files: Result<Vec<Bytes>, ParquetEncodingError> = (0..num_files)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * rows_per_file;
+                let end = std::cmp::min(start + rows_per_file, num_rows);
+                let chunk_len = end - start;
 
-                // Take rows according to the sorted indices
-                let chunk_columns: Result<Vec<_>, _> = batch
-                    .columns()
-                    .iter()
-                    .map(|col| take(col.as_ref(), &chunk_indices, None))
-                    .collect();
+                // Extract the chunk using sorted indices if available
+                let chunk_batch = if let Some(ref indices) = sorted_indices {
+                    // Slice the indices for this chunk
+                    let chunk_indices = indices.slice(start, chunk_len);
 
-                let chunk_columns = chunk_columns.map_err(|e| {
-                    ParquetEncodingError::RecordBatchCreation {
-                        source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
-                    }
-                })?;
+                    // Take rows according to the sorted indices
+                    let chunk_columns: Result<Vec<_>, _> = batch
+                        .columns()
+                        .iter()
+                        .map(|col| take(col.as_ref(), &chunk_indices, None))
+                        .collect();
 
-                arrow::array::RecordBatch::try_new(Arc::clone(&schema), chunk_columns).map_err(
-                    |e| ParquetEncodingError::RecordBatchCreation {
-                        source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
-                    },
-                )?
-            } else {
-                // No sorting, just slice the batch
-                batch.slice(start, chunk_len)
-            };
+                    let chunk_columns = chunk_columns.map_err(|e| {
+                        ParquetEncodingError::RecordBatchCreation {
+                            source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
+                        }
+                    })?;
 
-            // Expand JSON columns on this chunk if processors are configured
-            // Each chunk gets its own JSON-expanded schema based on that chunk's data
-            let chunk_batch = if let Some(processors) = &self.json_column_processors {
-                expand_json_columns(chunk_batch, processors, &[])?
-            } else {
-                chunk_batch
-            };
+                    arrow::array::RecordBatch::try_new(Arc::clone(&schema), chunk_columns).map_err(
+                        |e| ParquetEncodingError::RecordBatchCreation {
+                            source: super::arrow::ArrowEncodingError::RecordBatchCreation { source: e },
+                        },
+                    )?
+                } else {
+                    // No sorting, just slice the batch
+                    batch.slice(start, chunk_len)
+                };
 
-            // Encode this chunk to Parquet
-            let bytes = encode_record_batch_to_parquet(&chunk_batch, &self.writer_properties)?;
-            parquet_files.push(bytes);
-        }
+                // Expand JSON columns on this chunk if processors are configured
+                // Each chunk gets its own JSON-expanded schema based on that chunk's data
+                let chunk_batch = if let Some(processors) = &self.json_column_processors {
+                    expand_json_columns(chunk_batch, processors, &[])?
+                } else {
+                    chunk_batch
+                };
 
-        Ok(parquet_files)
+                // Encode this chunk to Parquet
+                encode_record_batch_to_parquet(&chunk_batch, &self.writer_properties)
+            })
+            .collect();
+
+        parquet_files
     }
 }
 
