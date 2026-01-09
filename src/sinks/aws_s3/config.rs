@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use aws_sdk_s3::Client as S3Client;
 use tower::ServiceBuilder;
@@ -9,7 +9,11 @@ use vector_lib::{
     sink::VectorSink,
 };
 
-use super::sink::S3RequestOptions;
+use super::{
+    disk_batch::DiskBatchConfig,
+    disk_backed_sink::{DiskBackedRequestBuilder, DiskBackedS3Sink},
+    sink::S3RequestOptions,
+};
 #[cfg(feature = "codecs-parquet")]
 use super::sink::S3SuperBatchRequestBuilder;
 #[cfg(feature = "codecs-parquet")]
@@ -158,6 +162,105 @@ pub struct S3SinkConfig {
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub retry_strategy: RetryStrategy,
+
+    /// Disk-backed batching configuration.
+    ///
+    /// When enabled, events are buffered to temporary files on disk instead of memory.
+    /// This is useful for high-cardinality partitioning (e.g., tens of thousands of unique
+    /// `key_prefix` values) with very large batch sizes (100k+ events, multiple GB per batch).
+    ///
+    /// This trades higher disk I/O for lower memory usage.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_batching: Option<DiskBatchingConfig>,
+}
+
+/// Configuration for disk-backed batching.
+///
+/// When enabled, events are buffered to temporary files on disk per partition instead of
+/// being kept in memory. This is designed for scenarios with:
+/// - High partition cardinality (tens of thousands of unique `key_prefix` values)
+/// - Very large batch sizes (100k events, 7-10GB per batch)
+/// - Limited available memory
+#[configurable_component]
+#[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct DiskBatchingConfig {
+    /// Directory to store temporary batch files.
+    ///
+    /// If not specified, defaults to `{data_dir}/s3-disk-batches/` where `data_dir` is
+    /// Vector's global data directory (typically `/var/lib/vector/`).
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "/var/lib/vector/s3-disk-batches"))]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Maximum number of bytes per batch before flushing to S3.
+    ///
+    /// This is the size of serialized events on disk, not the final compressed size.
+    /// Default is 10GB (10737418240 bytes).
+    #[serde(default = "default_disk_batch_max_bytes")]
+    #[configurable(metadata(docs::examples = 1073741824))]
+    #[configurable(metadata(docs::human_name = "Max Batch Bytes"))]
+    pub max_bytes: usize,
+
+    /// Maximum number of events per batch before flushing to S3.
+    #[serde(default = "default_disk_batch_max_events")]
+    #[configurable(metadata(docs::examples = 100000))]
+    #[configurable(metadata(docs::human_name = "Max Batch Events"))]
+    pub max_events: usize,
+
+    /// Timeout in seconds after which a batch is flushed regardless of size.
+    ///
+    /// The timer starts when the first event is written to a partition's batch.
+    #[serde(default = "default_disk_batch_timeout_secs")]
+    #[configurable(metadata(docs::examples = 300))]
+    #[configurable(metadata(docs::human_name = "Batch Timeout (seconds)"))]
+    pub timeout_secs: u64,
+}
+
+fn default_disk_batch_max_bytes() -> usize {
+    10 * 1024 * 1024 * 1024 // 10GB
+}
+
+fn default_disk_batch_max_events() -> usize {
+    100_000
+}
+
+fn default_disk_batch_timeout_secs() -> u64 {
+    300 // 5 minutes
+}
+
+impl Default for DiskBatchingConfig {
+    fn default() -> Self {
+        Self {
+            temp_dir: None,
+            max_bytes: default_disk_batch_max_bytes(),
+            max_events: default_disk_batch_max_events(),
+            timeout_secs: default_disk_batch_timeout_secs(),
+        }
+    }
+}
+
+impl DiskBatchingConfig {
+    /// Resolves the temp_dir using the global data_dir if not explicitly configured.
+    pub fn resolve_temp_dir(&self, global_data_dir: Option<&PathBuf>) -> PathBuf {
+        self.temp_dir.clone().unwrap_or_else(|| {
+            global_data_dir
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("/var/lib/vector"))
+                .join("s3-disk-batches")
+        })
+    }
+
+    /// Converts to DiskBatchConfig with the resolved temp_dir.
+    pub fn into_disk_batch_config(self, global_data_dir: Option<&PathBuf>) -> DiskBatchConfig {
+        DiskBatchConfig {
+            temp_dir: self.resolve_temp_dir(global_data_dir),
+            max_bytes: self.max_bytes,
+            max_events: self.max_events,
+            timeout: Duration::from_secs(self.timeout_secs),
+        }
+    }
 }
 
 pub(super) fn default_key_prefix() -> String {
@@ -188,6 +291,7 @@ impl GenerateConfig for S3SinkConfig {
             timezone: Default::default(),
             force_path_style: Default::default(),
             retry_strategy: Default::default(),
+            disk_batching: None,
         })
         .unwrap()
     }
@@ -249,6 +353,28 @@ impl S3SinkConfig {
         let partitioner = S3KeyPartitioner::new(key_prefix, ssekms_key_id, None);
 
         let (transformer, encoder) = self.encoding.build_encoder(SinkType::MessageBased)?;
+
+        // Check if disk-backed batching is enabled
+        if let Some(disk_config) = &self.disk_batching {
+            let batch_config = disk_config
+                .clone()
+                .into_disk_batch_config(cx.globals.data_dir.as_ref());
+
+            let request_builder = DiskBackedRequestBuilder {
+                bucket: self.bucket.clone(),
+                filename_time_format: self.filename_time_format.clone(),
+                filename_append_uuid: self.filename_append_uuid,
+                filename_extension: self.filename_extension.clone(),
+                api_options: self.options.clone(),
+                encoder: (transformer, encoder),
+                compression: self.compression,
+                filename_tz_offset: offset,
+            };
+
+            let sink = DiskBackedS3Sink::new(service, request_builder, partitioner, batch_config);
+
+            return Ok(VectorSink::from_event_streamsink(sink));
+        }
 
         let request_options = S3RequestOptions {
             bucket: self.bucket.clone(),
