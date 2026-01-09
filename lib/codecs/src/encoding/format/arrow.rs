@@ -8,7 +8,7 @@ use arrow::{
     array::{
         ArrayRef, BinaryBuilder, BooleanBuilder, Decimal128Builder, Decimal256Builder,
         Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
-        LargeStringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+        LargeStringBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
         TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
         UInt32Builder, UInt64Builder,
     },
@@ -268,7 +268,8 @@ pub fn build_record_batch(
             DataType::Timestamp(time_unit, _) => {
                 build_timestamp_array(events, field_name, *time_unit, nullable)?
             }
-            DataType::Utf8 | DataType::LargeUtf8 => build_string_array(events, field_name, nullable)?,
+            DataType::Utf8 => build_string_array(events, field_name, nullable, false)?,
+            DataType::LargeUtf8 => build_string_array(events, field_name, nullable, true)?,
             DataType::Int8 => build_int8_array(events, field_name, nullable)?,
             DataType::Int16 => build_int16_array(events, field_name, nullable)?,
             DataType::Int32 => build_int32_array(events, field_name, nullable)?,
@@ -418,53 +419,66 @@ fn build_timestamp_array(
     }
 }
 
+/// Macro to generate string array building logic for both StringBuilder and LargeStringBuilder
+macro_rules! build_string_array_impl {
+    ($builder:expr, $events:expr, $field_name:expr, $nullable:expr) => {{
+        for event in $events {
+            if let Event::Log(log) = event {
+                let mut appended = false;
+                if let Some(value) = log.get($field_name) {
+                    match value {
+                        Value::Bytes(bytes) => {
+                            // Attempt direct UTF-8 conversion first, fallback to lossy
+                            match std::str::from_utf8(bytes) {
+                                Ok(s) => $builder.append_value(s),
+                                Err(_) => $builder.append_value(&String::from_utf8_lossy(bytes)),
+                            }
+                            appended = true;
+                        }
+                        Value::Object(obj) => {
+                            if let Ok(s) = serde_json::to_string(&obj) {
+                                $builder.append_value(s);
+                                appended = true;
+                            }
+                        }
+                        Value::Array(arr) => {
+                            if let Ok(s) = serde_json::to_string(&arr) {
+                                $builder.append_value(s);
+                                appended = true;
+                            }
+                        }
+                        _ => {
+                            $builder.append_value(&value.to_string_lossy());
+                            appended = true;
+                        }
+                    }
+                }
+
+                if !appended {
+                    handle_null_constraints!($builder, $nullable, $field_name);
+                }
+            }
+        }
+    }};
+}
+
 fn build_string_array(
     events: &[Event],
     field_name: &str,
     nullable: bool,
+    use_large: bool,
 ) -> Result<ArrayRef, ArrowEncodingError> {
-    // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
-    let mut builder = LargeStringBuilder::with_capacity(events.len(), 0);
-
-    for event in events {
-        if let Event::Log(log) = event {
-            let mut appended = false;
-            if let Some(value) = log.get(field_name) {
-                match value {
-                    Value::Bytes(bytes) => {
-                        // Attempt direct UTF-8 conversion first, fallback to lossy
-                        match std::str::from_utf8(bytes) {
-                            Ok(s) => builder.append_value(s),
-                            Err(_) => builder.append_value(&String::from_utf8_lossy(bytes)),
-                        }
-                        appended = true;
-                    }
-                    Value::Object(obj) => {
-                        if let Ok(s) = serde_json::to_string(&obj) {
-                            builder.append_value(s);
-                            appended = true;
-                        }
-                    }
-                    Value::Array(arr) => {
-                        if let Ok(s) = serde_json::to_string(&arr) {
-                            builder.append_value(s);
-                            appended = true;
-                        }
-                    }
-                    _ => {
-                        builder.append_value(&value.to_string_lossy());
-                        appended = true;
-                    }
-                }
-            }
-
-            if !appended {
-                handle_null_constraints!(builder, nullable, field_name);
-            }
-        }
+    if use_large {
+        // Use LargeStringBuilder (i64 offsets) to avoid overflow with large batches
+        let mut builder = LargeStringBuilder::with_capacity(events.len(), 0);
+        build_string_array_impl!(builder, events, field_name, nullable);
+        Ok(Arc::new(builder.finish()))
+    } else {
+        // Use StringBuilder (i32 offsets) for backwards compatibility when schema specifies Utf8
+        let mut builder = StringBuilder::with_capacity(events.len(), 0);
+        build_string_array_impl!(builder, events, field_name, nullable);
+        Ok(Arc::new(builder.finish()))
     }
-
-    Ok(Arc::new(builder.finish()))
 }
 
 define_build_primitive_array_fn!(

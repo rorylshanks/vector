@@ -12,11 +12,6 @@ unwrap-used = "deny"
 name = "generate-avro-fixtures"
 path = "tests/bin/generate-avro-fixtures.rs"
 
-[[bin]]
-name = "stdin-to-parquet"
-path = "tests/bin/stdin_to_parquet.rs"
-required-features = ["parquet"]
-
 [dependencies]
 apache-avro = { version = "0.20.0", default-features = false }
 arrow = { version = "56.2.0", default-features = false, features = ["ipc"] }

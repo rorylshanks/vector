@@ -47,7 +47,7 @@ pub use otlp::{OtlpSerializer, OtlpSerializerConfig};
 #[cfg(feature = "parquet")]
 pub use parquet::{
     JsonColumnConfig, JsonTypeHint, ParquetCompression, ParquetEncodingError, ParquetSerializer,
-    ParquetSerializerConfig,
+    ParquetSerializerConfig, SortingColumnConfig,
 };
 pub use protobuf::{ProtobufSerializer, ProtobufSerializerConfig, ProtobufSerializerOptions};
 pub use raw_message::{RawMessageSerializer, RawMessageSerializerConfig};

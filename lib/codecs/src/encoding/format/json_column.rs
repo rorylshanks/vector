@@ -138,10 +138,13 @@ pub struct ProcessedJsonColumns {
     pub original_values: Option<Vec<Option<String>>>,
     /// Subcolumns with their flattened keys and values
     pub subcolumns: BTreeMap<String, SubcolumnData>,
-    /// Bucket maps for overflow keys (bucket_index -> (key -> value) pairs per row)
-    pub bucket_maps: Vec<Vec<HashMap<String, String>>>,
+    /// Bucket maps for overflow keys - sparse storage: bucket_index -> (row_index -> (key -> value))
+    /// Only rows with overflow data are stored, saving memory when most rows have no overflow
+    pub bucket_maps: Vec<HashMap<usize, HashMap<String, String>>>,
     /// Number of buckets
     pub bucket_count: usize,
+    /// Total number of rows (needed for generating arrays)
+    pub num_rows: usize,
 }
 
 /// Data for a single subcolumn
@@ -432,8 +435,9 @@ impl JsonColumnProcessor {
             })
             .collect();
 
-        let mut bucket_maps: Vec<Vec<Option<HashMap<String, String>>>> =
-            vec![vec![None; num_rows]; self.config.bucket_count];
+        // Use sparse storage for bucket maps - only allocate for rows that have overflow data
+        let mut bucket_maps: Vec<HashMap<usize, HashMap<String, String>>> =
+            vec![HashMap::new(); self.config.bucket_count];
 
         let num_keys = interned_keys.len();
         let mut key_to_builder: Vec<Option<usize>> = vec![None; num_keys];
@@ -463,8 +467,9 @@ impl JsonColumnProcessor {
                     let key = &interned_keys[*key_idx];
                     let bucket_idx = self.hash_key_to_bucket(key);
                     let value_str = value.to_string();
-                    bucket_maps[bucket_idx][row_idx]
-                        .get_or_insert_with(HashMap::new)
+                    bucket_maps[bucket_idx]
+                        .entry(row_idx)
+                        .or_insert_with(HashMap::new)
                         .insert(key.to_string(), value_str);
                 }
             }
@@ -483,15 +488,7 @@ impl JsonColumnProcessor {
 
         drop(all_flattened);
 
-        let bucket_maps: Vec<Vec<HashMap<String, String>>> = bucket_maps
-            .into_iter()
-            .map(|bucket| {
-                bucket
-                    .into_iter()
-                    .map(|opt_hm| opt_hm.unwrap_or_default())
-                    .collect()
-            })
-            .collect();
+        // bucket_maps is already in sparse format - no conversion needed
 
         ProcessedJsonColumns {
             column_name: self.config.column.clone(),
@@ -503,6 +500,7 @@ impl JsonColumnProcessor {
             subcolumns,
             bucket_maps,
             bucket_count: self.config.bucket_count,
+            num_rows,
         }
     }
 
@@ -590,14 +588,18 @@ impl ProcessedJsonColumns {
                 let value_builder = LargeStringBuilder::new();
                 let mut map_builder = MapBuilder::new(None, key_builder, value_builder);
 
-                for row_map in bucket_data {
-                    let mut sorted_entries: Vec<_> = row_map.iter().collect();
-                    sorted_entries.sort_by(|a, b| a.0.cmp(b.0));
+                // Iterate through all rows, looking up sparse data
+                for row_idx in 0..self.num_rows {
+                    if let Some(row_map) = bucket_data.get(&row_idx) {
+                        let mut sorted_entries: Vec<_> = row_map.iter().collect();
+                        sorted_entries.sort_by(|a, b| a.0.cmp(b.0));
 
-                    for (k, v) in sorted_entries {
-                        map_builder.keys().append_value(k);
-                        map_builder.values().append_value(v);
+                        for (k, v) in sorted_entries {
+                            map_builder.keys().append_value(k);
+                            map_builder.values().append_value(v);
+                        }
                     }
+                    // Append the map entry (empty if no data for this row)
                     map_builder.append(true).unwrap();
                 }
 
@@ -735,7 +737,7 @@ mod tests {
         let total_bucket_entries: usize = result
             .bucket_maps
             .iter()
-            .flat_map(|bucket| bucket.iter())
+            .flat_map(|bucket| bucket.values())
             .map(|map| map.len())
             .sum();
 

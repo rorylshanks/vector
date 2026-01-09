@@ -66,3 +66,5 @@ volumes/
 copilot-instructions.md
 
 testdata
+docker-compose.yml
+vector.yaml

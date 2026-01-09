@@ -2326,8 +2326,8 @@ mod tests {
         assert!(string_field.is_ok(), "Expected data.string_val field");
         assert_eq!(
             string_field.unwrap().data_type(),
-            &DataType::Utf8,
-            "string_val should be Utf8"
+            &DataType::LargeUtf8,
+            "string_val should be LargeUtf8"
         );
 
         println!("JSON column type inference test passed! Fields: {:?}", field_names);
@@ -2475,5 +2475,298 @@ mod tests {
         );
 
         println!("Infer schema basic test passed! Fields: {:?}", field_names);
+    }
+
+    #[test]
+    fn test_super_batch_with_json_column_expansion() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        // Create 100 events with JSON properties
+        let events: Vec<Event> = (0..100)
+            .map(|i| {
+                let mut log = LogEvent::default();
+                log.insert("id", i as i64);
+                log.insert(
+                    "properties",
+                    format!(
+                        r#"{{"user_id":"user{}","score":{},"active":{}}}"#,
+                        i,
+                        i * 10,
+                        i % 2 == 0
+                    ),
+                );
+                Event::Log(log)
+            })
+            .collect();
+
+        // Create explicit schema
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "id".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+        fields.insert(
+            "properties".to_string(),
+            FieldDefinition {
+                r#type: "string".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        // Configure super-batch with 30 rows per file AND JSON column expansion
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.rows_per_file = Some(30);
+        config.json_columns = Some(vec![JsonColumnConfig {
+            column: "properties".to_string(),
+            max_subcolumns: 10,
+            bucket_count: 4,
+            max_depth: 3,
+            keep_original_column: true,
+            type_hints: None,
+        }]);
+
+        let serializer = ParquetSerializer::new(config).unwrap();
+        assert!(serializer.is_super_batch_enabled());
+        assert!(serializer.has_json_columns());
+
+        // This should produce 4 files (30 + 30 + 30 + 10 = 100)
+        let files = serializer.encode_batch_split(events).unwrap();
+        assert_eq!(files.len(), 4, "Expected 4 files, got {}", files.len());
+
+        // Verify each file is valid Parquet with expanded JSON columns
+        for (idx, file_bytes) in files.iter().enumerate() {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file_bytes.clone())
+                .expect(&format!("Failed to create reader for file {}", idx))
+                .build()
+                .expect(&format!("Failed to build reader for file {}", idx));
+
+            let batches: Vec<_> = reader
+                .collect::<Result<_, _>>()
+                .expect(&format!("Failed to read batches from file {}", idx));
+
+            assert_eq!(batches.len(), 1, "Expected 1 batch in file {}", idx);
+
+            let batch = &batches[0];
+            let schema = batch.schema();
+            let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+            // Verify JSON subcolumns exist
+            assert!(
+                field_names.iter().any(|n| n.starts_with("properties.")),
+                "File {} should have expanded JSON subcolumns, got fields: {:?}",
+                idx,
+                field_names
+            );
+
+            // Verify original column is kept
+            assert!(
+                field_names.contains(&"properties"),
+                "File {} should keep original properties column, got fields: {:?}",
+                idx,
+                field_names
+            );
+
+            // Verify row count
+            let expected_rows = if idx == 3 { 10 } else { 30 };
+            assert_eq!(
+                batch.num_rows(),
+                expected_rows,
+                "File {} should have {} rows, got {}",
+                idx,
+                expected_rows,
+                batch.num_rows()
+            );
+        }
+
+        println!("Super-batch with JSON column expansion test passed!");
+    }
+
+    #[test]
+    fn test_super_batch_json_expansion_with_sorting() {
+        use super::super::schema_definition::FieldDefinition;
+        use std::collections::BTreeMap;
+
+        // Create events with JSON properties in random order
+        let events: Vec<Event> = vec![50, 10, 90, 30, 70, 20, 80, 40, 60, 0]
+            .into_iter()
+            .map(|i| {
+                let mut log = LogEvent::default();
+                log.insert("sort_key", i as i64);
+                log.insert(
+                    "data",
+                    format!(r#"{{"value":{},"name":"item{}"}}"#, i, i),
+                );
+                Event::Log(log)
+            })
+            .collect();
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "sort_key".to_string(),
+            FieldDefinition {
+                r#type: "int64".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+        fields.insert(
+            "data".to_string(),
+            FieldDefinition {
+                r#type: "string".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        // Configure with sorting, super-batch, and JSON expansion
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.rows_per_file = Some(3);
+        config.sorting_columns = Some(vec![SortingColumnConfig {
+            column: "sort_key".to_string(),
+            descending: false,
+        }]);
+        config.json_columns = Some(vec![JsonColumnConfig {
+            column: "data".to_string(),
+            max_subcolumns: 5,
+            bucket_count: 2,
+            max_depth: 2,
+            keep_original_column: false,
+            type_hints: None,
+        }]);
+
+        let serializer = ParquetSerializer::new(config).unwrap();
+        let files = serializer.encode_batch_split(events).unwrap();
+
+        // Should have 4 files (3 + 3 + 3 + 1 = 10)
+        assert_eq!(files.len(), 4, "Expected 4 files");
+
+        // Verify sorting is preserved and JSON is expanded in each file
+        let mut all_sort_keys: Vec<i64> = Vec::new();
+
+        for (idx, file_bytes) in files.iter().enumerate() {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file_bytes.clone())
+                .unwrap()
+                .build()
+                .unwrap();
+
+            let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+            let batch = &batches[0];
+            let schema = batch.schema();
+            let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+            // Verify JSON expansion happened (original column should NOT exist)
+            assert!(
+                !field_names.contains(&"data"),
+                "File {} should NOT have original 'data' column (keep_original_column=false), got: {:?}",
+                idx,
+                field_names
+            );
+
+            // Verify subcolumns exist
+            assert!(
+                field_names.iter().any(|n| n.starts_with("data.")),
+                "File {} should have data.* subcolumns, got: {:?}",
+                idx,
+                field_names
+            );
+
+            // Extract sort keys to verify ordering
+            let sort_key_idx = schema.fields().iter().position(|f| f.name() == "sort_key").unwrap();
+            let sort_key_array = batch
+                .column(sort_key_idx)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                all_sort_keys.push(sort_key_array.value(i));
+            }
+        }
+
+        // Verify global sort order
+        let expected: Vec<i64> = vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+        assert_eq!(
+            all_sort_keys, expected,
+            "Events should be sorted ascending by sort_key"
+        );
+
+        println!("Super-batch with sorting and JSON expansion test passed!");
+    }
+
+    #[test]
+    fn test_large_string_schema_consistency() {
+        use super::super::schema_definition::FieldDefinition;
+        use arrow::datatypes::DataType;
+        use std::collections::BTreeMap;
+
+        // Test that string fields use LargeUtf8 consistently
+        let mut log = LogEvent::default();
+        log.insert("text_field", "hello world");
+        log.insert("json_field", r#"{"key": "value"}"#);
+
+        let events = vec![Event::Log(log)];
+
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "text_field".to_string(),
+            FieldDefinition {
+                r#type: "string".to_string(),
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+        fields.insert(
+            "json_field".to_string(),
+            FieldDefinition {
+                r#type: "utf8".to_string(), // Also test "utf8" alias
+                bloom_filter: false,
+                bloom_filter_num_distinct_values: None,
+                bloom_filter_false_positive_pct: None,
+            },
+        );
+
+        let mut config = ParquetSerializerConfig::new(SchemaDefinition { fields });
+        config.json_columns = Some(vec![JsonColumnConfig {
+            column: "json_field".to_string(),
+            max_subcolumns: 10,
+            bucket_count: 2,
+            max_depth: 3,
+            keep_original_column: true,
+            type_hints: None,
+        }]);
+
+        let serializer = ParquetSerializer::new(config).unwrap();
+        let files = serializer.encode_batch_split(events).unwrap();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(files[0].clone())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        let schema = batches[0].schema();
+
+        // Verify all string fields use LargeUtf8
+        for field in schema.fields() {
+            if field.data_type() == &DataType::Utf8 {
+                panic!(
+                    "Field '{}' uses Utf8 instead of LargeUtf8 - this can cause overflow issues",
+                    field.name()
+                );
+            }
+        }
+
+        println!("Large string schema consistency test passed!");
     }
 }
