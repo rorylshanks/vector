@@ -83,6 +83,11 @@ impl DiskPartitionState {
         let file_name = format!("batch-{}-{}.tmp", std::process::id(), file_id);
         let file_path = temp_dir.join(file_name);
 
+        tracing::debug!(
+            file_path = %file_path.display(),
+            "Creating new disk partition state"
+        );
+
         // Create parent directory if needed
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)?;
@@ -172,6 +177,13 @@ impl DiskPartitionState {
     ///
     /// This closes the file writer and prepares the batch for reading.
     pub fn take_batch(&mut self) -> io::Result<DiskBatch> {
+        tracing::debug!(
+            file_path = %self.file_path.display(),
+            event_count = self.event_count,
+            bytes_written = self.bytes_written,
+            "Taking batch from partition"
+        );
+
         // Flush and close the writer
         if let Some(mut writer) = self.writer.take() {
             writer.flush()?;
@@ -337,22 +349,38 @@ where
 
         loop {
             // First, return any closed batches
-            if let Some(batch) = this.closed_batches.pop() {
+            if let Some((_key, batch)) = this.closed_batches.last() {
+                tracing::debug!(
+                    event_count = batch.event_count,
+                    bytes_on_disk = batch.bytes_on_disk,
+                    "Returning closed batch"
+                );
+                let batch = this.closed_batches.pop().unwrap();
                 return Poll::Ready(Some(batch));
             }
 
             // Poll the input stream
             match this.stream.as_mut().poll_next(cx) {
                 Poll::Pending => {
+                    tracing::trace!(
+                        partition_count = this.partitions.len(),
+                        expiration_count = this.expirations.len(),
+                        "Input stream pending, checking expirations"
+                    );
                     // Check for expired batches while pending
                     match this.expirations.poll_expired(cx) {
                         Poll::Ready(Some(expired)) => {
                             let key = expired.into_inner();
+                            tracing::debug!("Batch timeout expired, flushing partition");
                             this.expiration_map.remove(&key);
 
                             if let Some(mut state) = this.partitions.remove(&key) {
                                 match state.take_batch() {
                                     Ok(batch) => {
+                                        tracing::debug!(
+                                            event_count = batch.event_count,
+                                            "Batch ready from timeout"
+                                        );
                                         this.closed_batches.push((key, batch));
                                     }
                                     Err(e) => {
@@ -362,10 +390,21 @@ where
                             }
                             continue;
                         }
-                        Poll::Ready(None) | Poll::Pending => return Poll::Pending,
+                        Poll::Ready(None) => {
+                            tracing::trace!("No expirations scheduled, returning pending");
+                            return Poll::Pending;
+                        }
+                        Poll::Pending => {
+                            tracing::trace!("Expirations pending, returning pending");
+                            return Poll::Pending;
+                        }
                     }
                 }
                 Poll::Ready(None) => {
+                    tracing::debug!(
+                        partition_count = this.partitions.len(),
+                        "Input stream ended, flushing remaining partitions"
+                    );
                     // Stream ended, flush all remaining partitions
                     if !this.partitions.is_empty() {
                         this.expirations.clear();
@@ -375,6 +414,10 @@ where
                         for key in keys {
                             if let Some(mut state) = this.partitions.remove(&key) {
                                 if state.event_count() > 0 {
+                                    tracing::debug!(
+                                        event_count = state.event_count(),
+                                        "Flushing partition on stream end"
+                                    );
                                     match state.take_batch() {
                                         Ok(batch) => {
                                             this.closed_batches.push((key, batch));
@@ -388,6 +431,7 @@ where
                         }
                         continue;
                     }
+                    tracing::debug!("All partitions flushed, stream complete");
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(event)) => {
@@ -398,6 +442,11 @@ where
                     let state = if let Some(state) = this.partitions.get_mut(&key) {
                         state
                     } else {
+                        tracing::debug!(
+                            partition_count = this.partitions.len() + 1,
+                            timeout_secs = this.config.timeout.as_secs(),
+                            "Creating new partition"
+                        );
                         // Create new partition state
                         match DiskPartitionState::new(&this.config.temp_dir) {
                             Ok(state) => {
@@ -429,7 +478,23 @@ where
                     let should_flush =
                         event_count >= this.config.max_events || bytes_written >= this.config.max_bytes;
 
+                    // Log progress periodically
+                    if event_count % 10000 == 0 {
+                        tracing::debug!(
+                            event_count,
+                            bytes_written,
+                            max_events = this.config.max_events,
+                            max_bytes = this.config.max_bytes,
+                            "Partition progress"
+                        );
+                    }
+
                     if should_flush {
+                        tracing::info!(
+                            event_count,
+                            bytes_written,
+                            "Batch size/count limit reached, flushing"
+                        );
                         // Remove from expiration tracking
                         if let Some(exp_key) = this.expiration_map.remove(&key) {
                             this.expirations.remove(&exp_key);

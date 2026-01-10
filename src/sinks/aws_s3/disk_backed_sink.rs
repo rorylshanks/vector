@@ -130,9 +130,21 @@ impl DiskBackedRequestBuilder {
         partition_key: S3PartitionKey,
         mut batch: DiskBatch,
     ) -> Result<Vec<S3Request>, io::Error> {
+        tracing::debug!(
+            batch_event_count = batch.event_count,
+            batch_bytes_on_disk = batch.bytes_on_disk,
+            key_prefix = %partition_key.key_prefix,
+            "Building S3 request(s) from disk batch"
+        );
+
         // Read events from disk
         let mut events = batch.read_events()?;
         let total_events = events.len();
+
+        tracing::debug!(
+            events_read = total_events,
+            "Read events from disk batch file"
+        );
 
         // Get finalizers
         let finalizers = batch.take_finalizers();
@@ -357,32 +369,55 @@ where
 {
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let partitioner = self.partitioner;
-        let batch_config = self.batch_config;
+        let batch_config = self.batch_config.clone();
         let request_builder = self.request_builder;
+
+        tracing::info!(
+            temp_dir = %batch_config.temp_dir.display(),
+            max_events = batch_config.max_events,
+            max_bytes = batch_config.max_bytes,
+            timeout_secs = batch_config.timeout.as_secs(),
+            "Starting disk-backed S3 sink"
+        );
 
         // Create a wrapper partitioner that extracts the Option<S3PartitionKey>
         let wrapped_partitioner = OptionKeyPartitioner { inner: partitioner };
 
         // Use the disk-backed batcher
-        let batcher = DiskBackedPartitionedBatcher::new(input, wrapped_partitioner, batch_config);
+        let batcher = DiskBackedPartitionedBatcher::new(input, wrapped_partitioner, self.batch_config);
 
         // Process batches - may produce multiple requests per batch in super-batch mode
         batcher
             .flat_map(|(key, batch)| {
                 let request_builder = request_builder.clone();
 
+                tracing::debug!(
+                    batch_event_count = batch.event_count,
+                    has_partition_key = key.is_some(),
+                    "Received batch from batcher"
+                );
+
                 // Convert to stream of requests
                 let requests: Vec<S3Request> = match key {
                     Some(partition_key) => {
                         match request_builder.build_requests_from_batch(partition_key, batch) {
-                            Ok(reqs) => reqs,
+                            Ok(reqs) => {
+                                tracing::info!(
+                                    request_count = reqs.len(),
+                                    "Built S3 request(s) from batch"
+                                );
+                                reqs
+                            }
                             Err(error) => {
                                 emit!(SinkRequestBuildError { error });
                                 vec![]
                             }
                         }
                     }
-                    None => vec![],
+                    None => {
+                        tracing::warn!("Received batch with no partition key, skipping");
+                        vec![]
+                    }
                 };
 
                 futures::stream::iter(requests)
